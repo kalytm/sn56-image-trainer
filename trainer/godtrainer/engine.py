@@ -389,6 +389,7 @@ class Trainer:
         self.lora.attach(model, clip.patcher if clip is not None else None)
         if cfg.ckpt:
             log(f"checkpointed blocks (stride={cfg.ckpt_stride}):", enable_checkpointing(self.diff, stride=cfg.ckpt_stride))
+        self.ckpt_full = bool(cfg.ckpt) and cfg.ckpt_stride == 1
 
 
     def remaining(self):
@@ -866,6 +867,35 @@ class Trainer:
         self.save(self.best[2], self.best[3], score1, self.best[1])
         self.summary["retrain_all"] = {"skipped": False, "steps": steps2, "s_star": s_star, "select": select, "phase1_score": score1}
 
+    def _forward_backward(self, guider, extra, item, prompts, sigma, noise, band, lora, step):
+        """Loss and backward for one step. Memory fallback: if the step runs out of GPU memory while
+        some blocks are not checkpointed (recipes that ship --no-ckpt for speed), drop the partial
+        gradients, checkpoint every block and redo the step once. Memory use depends on the task's
+        image sizes, so a recipe that fits most tasks can otherwise fail a larger one at step 1."""
+        for attempt in (0, 1):
+            try:
+                losses = []
+                for prompt in prompts:
+                    with torch.enable_grad():
+                        mode_loss = self.loss(guider, extra, item, prompt, sigma, noise)
+                        (mode_loss * (self.band_weight(band) / len(prompts))).backward()
+                    losses.append(mode_loss.detach())
+                return losses
+            except torch.cuda.OutOfMemoryError:
+                if attempt or getattr(self, "ckpt_full", False):
+                    raise
+            # outside the except block, so the failed step's graph is released before the retry
+            losses = mode_loss = None
+            for q in lora.params:
+                q.grad = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            n = enable_checkpointing(self.diff, stride=1)
+            self.ckpt_full = True
+            self.step_time = None  # the scheduler re-learns the slower step time
+            self.summary["memory_fallback"] = {"step": step, "checkpointed_blocks": n}
+            log(f"out of GPU memory at step {step}; checkpointing all blocks ({n} newly wrapped) and retrying")
+
     def train_member(self, guider, extra, mi, budget_end, fixed_steps=None, select=None):
 
 
@@ -996,12 +1026,7 @@ class Trainer:
                 prompts = [item["caption"] if self.summary["steps"] % 2 == 0 else ""]
             else:
                 prompts = ["" if self.rng.random() < cfg.empty_prompt_frac else item["caption"]]
-            losses = []
-            for prompt in prompts:
-                with torch.enable_grad():
-                    mode_loss = self.loss(guider, extra, item, prompt, sigma, noise)
-                    (mode_loss * (self.band_weight(band) / len(prompts))).backward()
-                losses.append(mode_loss.detach())
+            losses = self._forward_backward(guider, extra, item, prompts, sigma, noise, band, lora, step)
             loss = torch.stack(losses).mean()
             torch.nn.utils.clip_grad_norm_(lora.params, cfg.grad_clip)
             opt.step()
