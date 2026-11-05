@@ -104,4 +104,3 @@ def test_no_oom_path_unchanged(env):
     losses = t._forward_backward(None, None, {}, ["a", ""], 0.5, None, 3, lora, step=5)
     assert len(losses) == 2 and t.calls["n"] == 2 and p.grad == 2
     assert env == [] and "memory_fallback" not in t.summary and t.step_time == 1.0
-

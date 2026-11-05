@@ -1076,9 +1076,11 @@ class Trainer:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()  # count completed device work, not just submission
                 if self.retry_t0 is not None:
-                    # memory fallback: earlier samples timed the faster mode; time the retried step alone
+                    # memory fallback: earlier samples timed the faster mode. The new sample is this
+                    # iteration's preparation plus the retried step through the EMA update (the failed
+                    # attempt and the recovery are one-off and excluded)
                     sched.reset_timing()
-                    sched.observe_step(time.time() - self.retry_t0)
+                    sched.observe_step((ts - t_iter) + (time.time() - self.retry_t0))
                     if sched.replan(step, time.time(), self.holdout_time or 60):
                         log(f"m{mi} replan after memory fallback at step {step}: horizon {sched.horizon}")
                 else:
