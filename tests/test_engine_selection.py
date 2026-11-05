@@ -10,13 +10,7 @@ import pytest
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
 sys.path.insert(0, os.path.join(ROOT, "trainer"))
-# engine.py imports torch/safetensors at module level; the selection wiring does not need them.
-sys.modules.setdefault("torch", mock.MagicMock(name="torch"))
-for name in ("safetensors", "safetensors.torch"):
-    sys.modules.setdefault(name, types.ModuleType(name))
-sys.modules["safetensors.torch"].save_file = lambda *a, **k: None
-sys.modules["safetensors.torch"].load_file = lambda *a, **k: {}
-
+# torch/safetensors are stubbed in conftest.py
 from godtrainer.engine import HoldoutAborted, Trainer  # noqa: E402
 
 

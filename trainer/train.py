@@ -136,6 +136,9 @@ def main():
         raise SystemExit("--select-rule paired compares arithmetic means; use --select-metric mean")
     if not 0 < cfg.base_eval_frac <= 1:
         raise SystemExit("--base-eval-frac must be in (0, 1]")
+    for name in ("epoch_cap", "eval_grid_gamma", "eval_frac_max", "eval_safety", "base_eval_frac"):
+        if not math.isfinite(getattr(cfg, name)):
+            raise SystemExit(f"--{name.replace('_', '-')} must be finite")
     if cfg.schedule == "steps":
         if cfg.calib_steps < 1 or cfg.eval_count < 1 or cfg.epoch_cap < 0:
             raise SystemExit("--calib-steps and --eval-count must be >= 1, --epoch-cap >= 0")

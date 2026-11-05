@@ -465,42 +465,70 @@ class Trainer:
             return float(np.quantile(per_image, 0.75))
         raise ValueError(f"unknown select_metric {metric!r}")
 
+    def _holdout_batch(self, guider, extra, item, prompt, x, b, s, start, stop):
+        """Per-case velocity losses for seeded noises ``start..stop-1`` of band ``b``."""
+        noise = torch.cat([
+            torch.randn(x.shape, generator=torch.Generator().manual_seed(case_seed(item["sha256"], b, k)),
+                        dtype=torch.float32)
+            for k in range(start, stop)
+        ]).to(self.device)
+        noisy = (1 - s) * x + s * noise
+        den = self.forward(guider, extra, item, prompt, noisy, s)
+        pred = (noisy.float() - den.float()) / s
+        return (pred - (noise - x).float()).square().flatten(1).mean(1).tolist()
+
+    def _holdout_check(self, t0, limit, done, total):
+        """Abort before work that cannot finish by ``limit``: at entry (done == 0) if the limit
+        has passed or the last measured full cost does not fit, otherwise when the observed
+        per-batch cost projects the remaining batches past it."""
+        now = time.time()
+        if now >= limit:
+            raise HoldoutAborted(max(now - t0, self.holdout_time or 0.0), done, total)
+        if done == 0:
+            if self.holdout_time and now + self.holdout_time > limit:
+                raise HoldoutAborted(self.holdout_time, done, total)
+            return
+        projected = (now - t0) / done * total
+        if t0 + projected > limit:
+            raise HoldoutAborted(projected, done, total)
+
     @torch.no_grad()
     def holdout_score(self, guider, extra, limit=None):
-        """Score the current weights on the holdout. With ``limit`` (a timestamp), the cost is
-        projected after every image x prompt-mode unit and HoldoutAborted is raised as soon as the
-        projected finish passes ``limit``."""
+        """Score the current weights on the holdout. With ``limit`` (a timestamp), the remaining
+        cost is projected before every forward batch and HoldoutAborted is raised as soon as the
+        work cannot finish by ``limit``; a result completed after ``limit`` is also discarded.
+        On abort the projected full cost becomes the new ``holdout_time`` estimate."""
         t0 = time.time()
         per_mode = {"text": [], "no_text": []}
         band_acc = np.zeros(self.bands)
-        units_total, units_done = 2 * len(self.holdout_items), 0
-        for item in self.holdout_items:
-            x = item["scaled"].to(self.device)
-            for mode in per_mode:
-                prompt = item["caption"] if mode == "text" else ""
-                losses = []
-                for b in range(self.bands):
-                    s = (b + 0.5) / self.bands
-                    band_losses = []
-                    for start in range(0, self.cfg.holdout_noises, self.cfg.holdout_noise_batch):
-                        stop = min(self.cfg.holdout_noises, start + self.cfg.holdout_noise_batch)
-                        noise = torch.cat([
-                            torch.randn(x.shape, generator=torch.Generator().manual_seed(case_seed(item["sha256"], b, k)),
-                                        dtype=torch.float32)
-                            for k in range(start, stop)
-                        ]).to(self.device)
-                        noisy = (1 - s) * x + s * noise
-                        den = self.forward(guider, extra, item, prompt, noisy, s)
-                        pred = (noisy.float() - den.float()) / s
-                        band_losses += (pred - (noise - x).float()).square().flatten(1).mean(1).tolist()
-                    losses += band_losses
-                    band_acc[b] += float(np.mean(band_losses))
-                per_mode[mode].append(float(np.mean(losses)))
-                units_done += 1
-                if limit is not None and units_done < units_total:
-                    projected = (time.time() - t0) / units_done * units_total
-                    if t0 + projected > limit:
-                        raise HoldoutAborted(projected, units_done, units_total)
+        n_batches = -(-self.cfg.holdout_noises // self.cfg.holdout_noise_batch)
+        total = 2 * len(self.holdout_items) * self.bands * n_batches
+        done = 0
+        try:
+            if limit is not None:
+                self._holdout_check(t0, limit, done, total)
+            for item in self.holdout_items:
+                x = item["scaled"].to(self.device)
+                for mode in per_mode:
+                    prompt = item["caption"] if mode == "text" else ""
+                    losses = []
+                    for b in range(self.bands):
+                        s = (b + 0.5) / self.bands
+                        band_losses = []
+                        for start in range(0, self.cfg.holdout_noises, self.cfg.holdout_noise_batch):
+                            if limit is not None and done:
+                                self._holdout_check(t0, limit, done, total)
+                            stop = min(self.cfg.holdout_noises, start + self.cfg.holdout_noise_batch)
+                            band_losses += self._holdout_batch(guider, extra, item, prompt, x, b, s, start, stop)
+                            done += 1
+                        losses += band_losses
+                        band_acc[b] += float(np.mean(band_losses))
+                    per_mode[mode].append(float(np.mean(losses)))
+            if limit is not None and time.time() > limit:
+                raise HoldoutAborted(time.time() - t0, done, total)  # finished late: discard
+        except HoldoutAborted as e:
+            self.holdout_time = max(self.holdout_time or 0.0, e.projected_s)
+            raise
 
         per_image = [0.5 * t + 0.5 * n for t, n in zip(per_mode["text"], per_mode["no_text"])]
         self.last_holdout_unit = selection.unit_vector(per_image)
@@ -524,15 +552,24 @@ class Trainer:
                 f" | per-img {[f'{v:.4f}' for v in per_image]}{extra_log}")
         return score
 
-    def evaluate_candidates(self, guider, extra, cands, step):
-
+    def evaluate_candidates(self, guider, extra, cands, step, limit=None):
+        """Score candidates in order before ``limit`` (default: task cutoff; members pass their own
+        budget). Once one is aborted the rest are skipped. Skipped candidates score NaN."""
+        limit = self.eval_limit() if limit is None else min(limit, self.eval_limit())
         out = []
+        aborted = False
         for tag, st, scale in cands:
+            if aborted:
+                log(f"[eval step {step}] {tag}: skipped (an earlier candidate hit the cutoff)")
+                self.summary.setdefault("skipped_evals", []).append({"step": step, "tag": tag})
+                out.append((float("nan"), tag))
+                continue
             if st is not None:
                 self.lora.set_tensors(st, scale)
             try:
-                sc = self.holdout_score(guider, extra, limit=self.eval_limit())
+                sc = self.holdout_score(guider, extra, limit=limit)
             except HoldoutAborted as e:
+                aborted = True
                 log(f"[eval step {step}] {tag}: skipped ({e}); deadline wins")
                 self.summary.setdefault("skipped_evals", []).append({"step": step, "tag": tag})
                 out.append((float("nan"), tag))  # a non-finite score never replaces a checkpoint
@@ -640,14 +677,19 @@ class Trainer:
         log("final:", json.dumps(self.summary["final"]))
 
     def _base_eval(self, guider, extra):
-        """Base holdout score, bounded by time. If the first units project past
-        ``base_eval_frac`` of the remaining budget, the noise count is reduced (fixed for the rest of
-        the run, so all candidates stay paired) and the evaluation restarts. At one noise it may use
-        the whole budget up to ``eval_limit``; returns None if even that cannot finish."""
+        """Base holdout score, bounded by time. If the first batches project past
+        ``base_eval_frac`` of the remaining scoring budget, the noise count is reduced (fixed for the
+        rest of the run, so all candidates stay paired) and the evaluation restarts; the cost
+        estimate is scaled to the new count so the retry is not judged on the old one. At one noise
+        it may use the whole budget up to ``eval_limit`` (``base_eval_frac`` is therefore not a hard
+        cap on total base-evaluation time); returns None if even that cannot finish."""
         cfg = self.cfg
         frac = getattr(cfg, "base_eval_frac", 1.0)
         while True:
             start = time.time()
+            if start >= self.eval_limit():
+                log("base evaluation: scoring cutoff already passed; shipping identity")
+                return None
             last_resort = cfg.holdout_noises <= 1
             limit = self.eval_limit() if last_resort else start + frac * max(0.0, self.eval_limit() - start)
             try:
@@ -662,6 +704,7 @@ class Trainer:
                     f"retrying with {new}")
                 self.summary.setdefault("holdout_noise_reductions", []).append(
                     {"from": cfg.holdout_noises, "to": new, "projected_s": e.projected_s, "allowed_s": allowed})
+                self.holdout_time = e.projected_s * new / cfg.holdout_noises
                 cfg.holdout_noises = new
 
     def retrain_all(self, guider, extra, phase1):
@@ -763,6 +806,7 @@ class Trainer:
             lr = cfg.lr * warm * (cfg.lr_final_frac + (1 - cfg.lr_final_frac) * 0.5 * (1 + math.cos(math.pi * p)))
             for g in opt.param_groups:
                 g["lr"] = lr * g["lr_mult"]
+            t_iter = time.time()  # full iteration: case/noise preparation through the EMA update
 
             if cfg.case_cycle:
                 band_hi = cfg.band_max
@@ -846,18 +890,22 @@ class Trainer:
             if step % 25 == 0:
                 log(f"m{mi} step {step} loss {loss.item():.4f} band {band} lr {lr:.2e} step_t {self.step_time:.2f}s left {budget_end - time.time():.0f}s")
             if sched is not None:
-                sched.observe_step(dt)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()  # count completed device work, not just submission
+                sched.observe_step(time.time() - t_iter)
                 eval_s = self.holdout_time or 60
                 if sched.eval_due(step, time.time(), eval_s):
                     last_eval_step = step
-                    best = self._select(guider, extra, lora, ema, best, step, mi)
-                    history.append(lora.state())
+                    best, ok = self._select(guider, extra, lora, ema, best, step, mi, limit=budget_end)
+                    if ok:
+                        history.append(lora.state())
                     if sched.replan(step, time.time(), self.holdout_time or 60):
                         log(f"m{mi} replan at step {step}: horizon {sched.horizon}")
             elif fixed_steps is None and (eval_due or step == cfg.eval_every):
                 last_eval_step = step
-                best = self._select(guider, extra, lora, ema, best, step, mi)
-                history.append(lora.state())
+                best, ok = self._select(guider, extra, lora, ema, best, step, mi, limit=budget_end)
+                if ok:
+                    history.append(lora.state())
         if fixed_steps is not None:
             if select == "ema" and ema is not None:
                 state = {n: tuple(q.detach().clone() for q in tensors)
@@ -867,15 +915,17 @@ class Trainer:
             log(f"member {mi} (fixed) done: steps={step}/{fixed_steps} shipped {select}@{step} (blind)")
             return (float("nan"), f"{select}@{step}", state)
 
-        if step > last_eval_step and self.remaining() > cfg.save_reserve + (self.holdout_time or 60) * 2.1:
-            best = self._select(guider, extra, lora, ema, best, step, mi)
-            history.append(lora.state())
+        member_cutoff = min(budget_end, self.eval_limit())
+        if step > last_eval_step and time.time() + (self.holdout_time or 60) * 2.1 < member_cutoff:
+            best, ok = self._select(guider, extra, lora, ema, best, step, mi, limit=budget_end)
+            if ok:
+                history.append(lora.state())
         if (cfg.delta_average > 1 and len(history) >= cfg.delta_average
                 and time.time() + (self.holdout_time or 60) * 1.1 < budget_end):
             count = cfg.delta_average
             averaged = soup_tensors(history[-count:], self.device)
             tag = f"m{mi}:deltaavg{count}@{step}"
-            sc = self.evaluate_candidates(guider, extra, [(tag, averaged, lora.scale)], step)[0][0]
+            sc = self.evaluate_candidates(guider, extra, [(tag, averaged, lora.scale)], step, limit=budget_end)[0][0]
             if self._better(sc, tag, best[0], best[1]):
                 state = {n: tuple(q.detach().clone() for q in tensors) for n, tensors in averaged.items()}
                 best = (sc, tag, state)
@@ -887,12 +937,13 @@ class Trainer:
         log(f"member {mi} done: steps={step} best={best[1]} {best[0]:.6f} ({(best[0] / self.base_score - 1) * 100:+.2f}% vs base)")
         return best
 
-    def _select(self, guider, extra, lora, ema, best, step, mi=0):
+    def _select(self, guider, extra, lora, ema, best, step, mi=0, limit=None):
+        """Score raw and EMA at ``step`` before ``limit``; returns (best, raw_was_scored)."""
         cands = [(f"m{mi}:raw@{step}", None, None)]
         if ema is not None:
             ema_state = lora.state_from_flat(ema)
             cands.append((f"m{mi}:ema@{step}", ema_state, lora.scale))
-        scores = self.evaluate_candidates(guider, extra, cands, step)
+        scores = self.evaluate_candidates(guider, extra, cands, step, limit=limit)
         for (sc, tag), (_, st, _) in zip(scores, cands):
             if self._better(sc, tag, best[0], best[1]):
                 state = lora.state() if st is None else {n: (u.detach().clone(), d.detach().clone()) for n, (u, d) in st.items()}
@@ -900,7 +951,7 @@ class Trainer:
                 if self._better(sc, best[1], self.best[0], self.best[1]):
                     self.best = (sc, best[1], [state], lora.scale)
                     self.save([state], lora.scale, sc, best[1])
-        return best
+        return best, math.isfinite(scores[0][0])
 
 
 def make_guider(model, cond):
