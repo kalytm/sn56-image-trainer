@@ -79,6 +79,13 @@ def parse():
     p.add_argument("--eval-grid-gamma", type=float, default=2.0, help=">1 packs evaluations toward the end of the cosine")
     p.add_argument("--eval-frac-max", type=float, default=0.35, help="max share of member time spent on in-loop evaluations")
     p.add_argument("--eval-safety", type=float, default=1.2, help="multiplier on measured evaluation time when reserving")
+    p.add_argument("--crossfit", action="store_true",
+                   help="D2: two members on complementary image folds, each selecting on the other fold; ship the exact "
+                        "average of their deltas (rule and thresholds predeclared from the training-only dev suite)")
+    p.add_argument("--crossfit-min-images", type=int, default=8, help="apply cross-fit only with at least this many images")
+    p.add_argument("--crossfit-min-member-s", type=float, default=900.0,
+                   help="apply cross-fit only if each member gets at least this many seconds")
+    p.add_argument("--crossfit-eval-max", type=int, default=8, help="max out-of-fold images used for a member's step selection")
     p.add_argument("--base-eval-frac", type=float, default=0.15,
                    help="max share of the remaining budget for the base holdout; above it the noise count is reduced")
     p.add_argument("--select-metric", default="mean", choices=["mean", "worst", "p75"],
@@ -136,6 +143,13 @@ def main():
         raise SystemExit("--select-rule paired compares arithmetic means; use --select-metric mean")
     if not 0 < cfg.base_eval_frac <= 1:
         raise SystemExit("--base-eval-frac must be in (0, 1]")
+    if cfg.crossfit:
+        if cfg.soup > 1 or cfg.retrain_all or cfg.hflip or cfg.crop_aug:
+            raise SystemExit("--crossfit excludes --soup > 1, --retrain-all, --hflip and --crop-aug")
+        if cfg.crossfit_min_images < 2 or cfg.crossfit_eval_max < 1:
+            raise SystemExit("--crossfit-min-images must be >= 2 and --crossfit-eval-max >= 1")
+        if not (math.isfinite(cfg.crossfit_min_member_s) and cfg.crossfit_min_member_s >= 0):
+            raise SystemExit("--crossfit-min-member-s must be finite and >= 0")
     for name in ("epoch_cap", "eval_grid_gamma", "eval_frac_max", "eval_safety", "base_eval_frac"):
         if not math.isfinite(getattr(cfg, name)):
             raise SystemExit(f"--{name.replace('_', '-')} must be finite")

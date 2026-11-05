@@ -625,6 +625,8 @@ class Trainer:
         ident = [self.lora.state()]
         # a valid fallback exists before any long scoring starts
         self.save(ident, self.lora.scale, float("nan"), "identity")
+        if self._crossfit_ok():
+            return self._run_crossfit(guider, extra, t_start)
         self.base_score = self._base_eval(guider, extra)
         if self.base_score is None:
             self.best = (float("nan"), "identity", ident, self.lora.scale)
@@ -676,7 +678,7 @@ class Trainer:
         json.dump(self.summary, open(os.path.join(self.out_dir, "summary.json"), "w"), indent=1)
         log("final:", json.dumps(self.summary["final"]))
 
-    def _base_eval(self, guider, extra):
+    def _base_eval(self, guider, extra, cutoff=None):
         """Base holdout score, bounded by time. If the first batches project past
         ``base_eval_frac`` of the remaining scoring budget, the noise count is reduced (fixed for the
         rest of the run, so all candidates stay paired) and the evaluation restarts; the cost
@@ -685,13 +687,14 @@ class Trainer:
         cap on total base-evaluation time); returns None if even that cannot finish."""
         cfg = self.cfg
         frac = getattr(cfg, "base_eval_frac", 1.0)
+        cutoff = self.eval_limit() if cutoff is None else min(cutoff, self.eval_limit())
         while True:
             start = time.time()
-            if start >= self.eval_limit():
+            if start >= cutoff:
                 log("base evaluation: scoring cutoff already passed; shipping identity")
                 return None
             last_resort = cfg.holdout_noises <= 1
-            limit = self.eval_limit() if last_resort else start + frac * max(0.0, self.eval_limit() - start)
+            limit = cutoff if last_resort else start + frac * max(0.0, cutoff - start)
             try:
                 return self.holdout_score(guider, extra, limit=limit)
             except HoldoutAborted as e:
@@ -706,6 +709,93 @@ class Trainer:
                     {"from": cfg.holdout_noises, "to": new, "projected_s": e.projected_s, "allowed_s": allowed})
                 self.holdout_time = e.projected_s * new / cfg.holdout_noises
                 cfg.holdout_noises = new
+
+    def _global_select(self):
+        """False in cross-fit mode: members are scored on different holdouts, so their scores are
+        never compared with each other (or with a global incumbent)."""
+        return getattr(self, "global_select", True)
+
+    # --- D2: two-fold cross-fit soup -------------------------------------------------------------
+    def crossfit_folds(self):
+        """Deterministic split of the (non-augmented) task images into two folds of near-equal size."""
+        base = [it for it in self.items if not it.get("aug")]
+        idx = list(range(len(base)))
+        random.Random(self.cfg.seed + 17).shuffle(idx)
+        return [base[i] for i in idx[0::2]], [base[i] for i in idx[1::2]]
+
+    def _crossfit_ok(self):
+        """Fixed rule (thresholds are predeclared from the training-only dev suite, never per task):
+        cross-fit only with enough images for two folds and enough time for two members."""
+        cfg = self.cfg
+        if not getattr(cfg, "crossfit", False):
+            return False
+        n = sum(1 for it in self.items if not it.get("aug"))
+        member_s = (self.remaining() - cfg.save_reserve) / 2
+        ok = n >= cfg.crossfit_min_images and member_s >= cfg.crossfit_min_member_s
+        self.summary["crossfit_rule"] = {"images": n, "member_s": member_s, "applied": ok,
+                                         "min_images": cfg.crossfit_min_images,
+                                         "min_member_s": cfg.crossfit_min_member_s}
+        if not ok:
+            log(f"cross-fit not applied: {n} images, {member_s:.0f}s per member "
+                f"(needs >= {cfg.crossfit_min_images} images and >= {cfg.crossfit_min_member_s:.0f}s)")
+        return ok
+
+    @staticmethod
+    def _is_base(tag):
+        return tag is None or tag.endswith("base")
+
+    def _run_crossfit(self, guider, extra, t_start):
+        """Member 0 trains on fold A and selects its step (D1) on fold B; member 1 the reverse.
+        The shipped weights are the exact average of both members' selected deltas. There is no
+        per-task acceptance test of the soup: no unbiased holdout is left for the averaged
+        weights, and member out-of-fold minima are selection-biased (logged as diagnostics only).
+        If only one member produced a non-base checkpoint, that member is shipped alone."""
+        cfg = self.cfg
+        self.global_select = False
+        folds = self.crossfit_folds()
+        log(f"cross-fit: folds of {len(folds[0])} and {len(folds[1])} images; "
+            f"selection holdout <= {cfg.crossfit_eval_max} images per member")
+        scale = self.lora.scale
+        results, diag = [], []
+        for mi in range(2):
+            train, hold = folds[mi], folds[1 - mi]
+            budget_end = time.time() + (self.remaining() - cfg.save_reserve) / (2 - mi)
+            if mi > 0:
+                self.lora.reinit(cfg.seed + 1000 * mi)
+            self.train_items = list(train)
+            self.holdout_items = list(hold[:cfg.crossfit_eval_max])
+            self.holdout_time, self.base_bands = None, None  # different holdout: re-measure
+            self.base_tag = f"m{mi}:base"
+            base = self._base_eval(guider, extra, cutoff=budget_end)
+            if base is None:
+                log(f"cross-fit m{mi}: base evaluation cannot finish in the member budget; stopping")
+                break
+            self.base_score = base
+            self.vectors[self.base_tag] = self.last_holdout_unit
+            res = self.train_member(guider, extra, mi, budget_end)
+            if res is None:
+                break
+            results.append(res)
+            diag.append({"member": mi, "train_images": len(train), "holdout_images": len(self.holdout_items),
+                         "base": base, "best_tag": res[1], "best_oof_biased": res[0],
+                         "rel_pct_oof_biased": (res[0] / base - 1) * 100 if base else None})
+            if mi == 0 and not self._is_base(res[1]):
+                self.save([res[2]], scale, float("nan"), f"crossfit-m0:{res[1]}")  # fallback
+        good = [r for r in results if not self._is_base(r[1])]
+        if len(good) == 2:
+            tag = f"crossfit-soup:{good[0][1]}+{good[1][1]}"
+            self.save([good[0][2], good[1][2]], scale, float("nan"), tag)
+        elif len(good) == 1:
+            tag = f"crossfit-single:{good[0][1]}"
+            if good[0] is not (results[0] if results else None):  # m0 was already saved as fallback
+                self.save([good[0][2]], scale, float("nan"), tag)
+        else:
+            tag = "identity"
+        self.summary["crossfit"] = diag
+        self.summary["final"] = {"best": tag, "score": None, "base": None, "rel_pct": None,
+                                 "wall_s": time.time() - t_start, "note": "cross-fit: no unbiased per-task score"}
+        json.dump(self.summary, open(os.path.join(self.out_dir, "summary.json"), "w"), indent=1)
+        log("final:", json.dumps(self.summary["final"]))
 
     def retrain_all(self, guider, extra, phase1):
 
@@ -762,7 +852,7 @@ class Trainer:
             weight_decay=cfg.weight_decay, eps=1e-8,
         )
         ema = [p.detach().clone() for p in lora.params] if cfg.ema > 0 else None
-        best = (self.base_score, "base", lora.state())
+        best = (self.base_score, getattr(self, "base_tag", "base"), lora.state())
         history = []
         t0 = time.time()
         step, order, band_perm, cases, bi = 0, [], [], [], 0
@@ -929,7 +1019,7 @@ class Trainer:
             if self._better(sc, tag, best[0], best[1]):
                 state = {n: tuple(q.detach().clone() for q in tensors) for n, tensors in averaged.items()}
                 best = (sc, tag, state)
-                if self._better(sc, tag, self.best[0], self.best[1]):
+                if self._global_select() and self._better(sc, tag, self.best[0], self.best[1]):
                     self.best = (sc, tag, [state], lora.scale)
                     self.save([state], lora.scale, sc, tag)
         if sched is not None:
@@ -948,7 +1038,7 @@ class Trainer:
             if self._better(sc, tag, best[0], best[1]):
                 state = lora.state() if st is None else {n: (u.detach().clone(), d.detach().clone()) for n, (u, d) in st.items()}
                 best = (sc, tag, state)
-                if self._better(sc, best[1], self.best[0], self.best[1]):
+                if self._global_select() and self._better(sc, best[1], self.best[0], self.best[1]):
                     self.best = (sc, best[1], [state], lora.scale)
                     self.save([state], lora.scale, sc, best[1])
         return best, math.isfinite(scores[0][0])
