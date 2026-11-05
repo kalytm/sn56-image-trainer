@@ -22,6 +22,17 @@ class _NoGrad:
 
 _torch = mock.MagicMock(name="torch")
 _torch.no_grad = _NoGrad
+# Real attributes (not auto-created children) so monkeypatching them restores cleanly between tests.
+_torch.enable_grad = _NoGrad
+
+
+class _OutOfMemoryError(RuntimeError):
+    pass
+
+
+_torch.cuda.OutOfMemoryError = _OutOfMemoryError
+_torch.cuda.is_available = lambda: True  # the existing tests take the CUDA-sync path (mocked)
+_torch.cuda.empty_cache = lambda: None
 sys.modules.setdefault("torch", _torch)
 for name in ("safetensors", "safetensors.torch"):
     sys.modules.setdefault(name, types.ModuleType(name))

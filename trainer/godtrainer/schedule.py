@@ -90,6 +90,10 @@ class StepSchedule:
     def observe_step(self, dt):
         self._dts.append(float(dt))
 
+    def reset_timing(self):
+        """Drop step samples after an execution-mode change (memory fallback to full checkpointing)."""
+        self._dts = []
+
     def sec_per_step(self, fallback=3.0):
         """Median of the most recent step times (robust to slow first steps and eval stalls)."""
         recent = self._dts[-15:]

@@ -867,11 +867,17 @@ class Trainer:
         self.save(self.best[2], self.best[3], score1, self.best[1])
         self.summary["retrain_all"] = {"skipped": False, "steps": steps2, "s_star": s_star, "select": select, "phase1_score": score1}
 
-    def _forward_backward(self, guider, extra, item, prompts, sigma, noise, band, lora, step):
+    def _forward_backward(self, guider, extra, item, prompts, sigma, noise, band, lora, step, admit=None):
         """Loss and backward for one step. Memory fallback: if the step runs out of GPU memory while
         some blocks are not checkpointed (recipes that ship --no-ckpt for speed), drop the partial
-        gradients, checkpoint every block and redo the step once. Memory use depends on the task's
-        image sizes, so a recipe that fits most tasks can otherwise fail a larger one at step 1."""
+        gradients, checkpoint every block and redo the step once, if ``admit(failed_s)`` says the
+        retry still fits the member's cutoff. Returns the per-prompt losses, or None when the retry
+        does not fit (the caller then ends the member without an update). ``self.retry_t0`` is the
+        retry's start time (None without a fallback) so the caller can time the checkpointed step.
+        Memory use depends on the task's image sizes, so a recipe that fits most tasks can otherwise
+        fail a larger one."""
+        self.retry_t0 = None
+        t_start = time.time()
         for attempt in (0, 1):
             try:
                 losses = []
@@ -892,9 +898,30 @@ class Trainer:
                 torch.cuda.empty_cache()
             n = enable_checkpointing(self.diff, stride=1)
             self.ckpt_full = True
-            self.step_time = None  # the scheduler re-learns the slower step time
-            self.summary["memory_fallback"] = {"step": step, "checkpointed_blocks": n}
+            failed_s = time.time() - t_start
+            fits = admit is None or admit(failed_s)
+            self.step_time = None  # the time schedule re-learns the slower step
+            self.summary["memory_fallback"] = {"step": step, "checkpointed_blocks": n,
+                                               "failed_s": round(failed_s, 2), "retried": bool(fits)}
+            if not fits:
+                log(f"out of GPU memory at step {step}; checkpointed all blocks ({n} newly wrapped); "
+                    f"no time left to retry, ending the member")
+                return None
             log(f"out of GPU memory at step {step}; checkpointing all blocks ({n} newly wrapped) and retrying")
+            self.retry_t0 = time.time()
+
+    def _retry_fits(self, failed_s, budget_end, sched, fixed_steps):
+        """Admission for a memory-fallback retry: 1.5x the larger of the failed attempt and the current
+        step estimate (checkpointing recomputes the forward), plus the reserve the loop keeps after a
+        step (the step schedule's tail, the time schedule's evaluation reserve), must fit the cutoff."""
+        eval_s = self.holdout_time or 60
+        if sched is not None:
+            est, reserve = sched.sec_per_step(), sched.tail_s(eval_s)
+        else:
+            est = self.step_time or 3.0
+            reserve = 0.0 if fixed_steps is not None else \
+                eval_s * (3.3 if self.cfg.delta_average > 1 else 2.2) + 5
+        return time.time() + 1.5 * max(failed_s, est) + reserve <= budget_end
 
     def train_member(self, guider, extra, mi, budget_end, fixed_steps=None, select=None):
 
@@ -1026,7 +1053,11 @@ class Trainer:
                 prompts = [item["caption"] if self.summary["steps"] % 2 == 0 else ""]
             else:
                 prompts = ["" if self.rng.random() < cfg.empty_prompt_frac else item["caption"]]
-            losses = self._forward_backward(guider, extra, item, prompts, sigma, noise, band, lora, step)
+            losses = self._forward_backward(
+                guider, extra, item, prompts, sigma, noise, band, lora, step,
+                admit=lambda failed_s: self._retry_fits(failed_s, budget_end, sched, fixed_steps))
+            if losses is None:
+                break
             loss = torch.stack(losses).mean()
             torch.nn.utils.clip_grad_norm_(lora.params, cfg.grad_clip)
             opt.step()
@@ -1044,7 +1075,14 @@ class Trainer:
             if sched is not None:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()  # count completed device work, not just submission
-                sched.observe_step(time.time() - t_iter)
+                if self.retry_t0 is not None:
+                    # memory fallback: earlier samples timed the faster mode; time the retried step alone
+                    sched.reset_timing()
+                    sched.observe_step(time.time() - self.retry_t0)
+                    if sched.replan(step, time.time(), self.holdout_time or 60):
+                        log(f"m{mi} replan after memory fallback at step {step}: horizon {sched.horizon}")
+                else:
+                    sched.observe_step(time.time() - t_iter)
                 eval_s = self.holdout_time or 60
                 if sched.eval_due(step, time.time(), eval_s):
                     last_eval_step = step

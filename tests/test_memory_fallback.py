@@ -69,7 +69,20 @@ def test_oom_enables_checkpointing_and_retries(env):
     assert losses == ["loss", "loss"] and t.calls["n"] == 4
     assert p.grad == 2  # the failed attempt's partial gradient was dropped, not accumulated
     assert env == [1] and t.ckpt_full and t.step_time is None
-    assert t.summary["memory_fallback"] == {"step": 0, "checkpointed_blocks": 7}
+    fb = t.summary["memory_fallback"]
+    assert fb["step"] == 0 and fb["checkpointed_blocks"] == 7 and fb["retried"] is True
+    assert t.retry_t0 is not None
+
+
+def test_retry_refused_by_admission_returns_none(env):
+    t, lora, p = trainer(fail_times=2)
+    seen = []
+    out = t._forward_backward(None, None, {}, ["a", ""], 0.5, None, 3, lora, step=9,
+                              admit=lambda failed_s: seen.append(failed_s) or False)
+    assert out is None and t.calls["n"] == 2 and len(seen) == 1
+    assert p.grad is None  # the partial gradient of the failed attempt is not left for an update
+    assert env == [1] and t.ckpt_full  # later members still get the memory-safe mode
+    assert t.summary["memory_fallback"]["retried"] is False and t.retry_t0 is None
 
 
 def test_second_oom_after_fallback_raises(env):
@@ -91,3 +104,4 @@ def test_no_oom_path_unchanged(env):
     losses = t._forward_backward(None, None, {}, ["a", ""], 0.5, None, 3, lora, step=5)
     assert len(losses) == 2 and t.calls["n"] == 2 and p.grad == 2
     assert env == [] and "memory_fallback" not in t.summary and t.step_time == 1.0
+
