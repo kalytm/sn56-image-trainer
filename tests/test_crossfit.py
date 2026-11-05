@@ -77,7 +77,7 @@ def test_members_train_and_select_on_complementary_folds_and_ship_the_soup(tmp_p
     assert seen[1]["train"] == ids_b and seen[1]["hold"] <= ids_a
     assert [s["base_tag"] for s in seen] == ["m0:base", "m1:base"]
     assert not any(s["global"] for s in seen)
-    assert saves == [(1, "crossfit-m0:m0:ema@300"), (2, "crossfit-soup:m0:ema@300+m1:deltaavg2@400")]
+    assert saves == [(1, "crossfit-single:m0:ema@300"), (2, "crossfit-soup:m0:ema@300+m1:deltaavg2@400")]
     assert t.summary["final"]["best"].startswith("crossfit-soup:")
     assert all(d["best_oof_biased"] == 0.4 for d in t.summary["crossfit"])
 
@@ -85,7 +85,7 @@ def test_members_train_and_select_on_complementary_folds_and_ship_the_soup(tmp_p
 def test_member_without_gain_is_not_averaged_in(tmp_path):
     t = make()
     saves, _ = run_with_members(t, tmp_path, ["m0:ema@300", "m1:base"])
-    assert saves == [(1, "crossfit-m0:m0:ema@300")]
+    assert saves == [(1, "crossfit-single:m0:ema@300")]
     assert t.summary["final"]["best"] == "crossfit-single:m0:ema@300"
     t = make()
     saves, _ = run_with_members(t, tmp_path, ["m0:base", "m1:raw@500"])

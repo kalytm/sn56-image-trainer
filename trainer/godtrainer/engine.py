@@ -609,7 +609,9 @@ class Trainer:
         save_file(sd, tmp, metadata={"godtrainer": tag})
         os.replace(tmp, os.path.join(self.out_dir, "last.safetensors"))
         self.saved_score = score
-        self.summary.update(saved={"tag": tag, "score": score, "base": self.base_score, "rel_pct": (score / self.base_score - 1) * 100 if self.base_score else None})
+        known = math.isfinite(score) and bool(self.base_score)
+        self.summary.update(saved={"tag": tag, "score": score if math.isfinite(score) else None, "base": self.base_score,
+                                   "rel_pct": (score / self.base_score - 1) * 100 if known else None})
         json.dump(self.summary, open(os.path.join(self.out_dir, "summary.json"), "w"), indent=1)
         log(f"saved {tag} score={score:.6f}")
 
@@ -780,7 +782,7 @@ class Trainer:
                          "base": base, "best_tag": res[1], "best_oof_biased": res[0],
                          "rel_pct_oof_biased": (res[0] / base - 1) * 100 if base else None})
             if mi == 0 and not self._is_base(res[1]):
-                self.save([res[2]], scale, float("nan"), f"crossfit-m0:{res[1]}")  # fallback
+                self.save([res[2]], scale, float("nan"), f"crossfit-single:{res[1]}")  # fallback
         good = [r for r in results if not self._is_base(r[1])]
         if len(good) == 2:
             tag = f"crossfit-soup:{good[0][1]}+{good[1][1]}"
