@@ -51,6 +51,20 @@ def test_falls_back_to_mean_without_vectors():
     assert should_replace(0.3, "raw@1", None, float("inf"), "base", None)
 
 
-def test_unit_vector_prefers_images_then_cells():
+def test_unit_vector_is_per_image_only():
     assert unit_vector([1, 2, 3], [9] * 48) == [1, 2, 3]
-    assert unit_vector([1, 2], [9] * 32) == [9] * 32
+    assert unit_vector([1, 2], [9] * 32) == [1, 2]
+    assert unit_vector(None, [9] * 32) is None
+
+
+def test_fewer_than_three_images_uses_champion_rule():
+    best, cand = [0.20, 0.30], [0.199, 0.302]
+    # A lower mean wins outright with only two images, even for an earlier raw state.
+    assert should_replace(0.2499, "raw@300", cand, 0.25, "ema@600", best)
+    assert not should_replace(0.2501, "deltaavg2@900", cand, 0.25, "raw@300", best)
+
+
+def test_tie_replacements_never_raise_the_incumbent_mean():
+    best = [0.100, 0.200, 0.300, 0.400]
+    slightly_worse = [0.1001, 0.2001, 0.3001, 0.4001]
+    assert not should_replace(0.25001, "deltaavg2@900", slightly_worse, 0.25, "raw@300", best)

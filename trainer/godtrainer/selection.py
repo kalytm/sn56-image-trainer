@@ -43,25 +43,30 @@ def paired_stats(candidate, incumbent):
     return mean, se
 
 
-def unit_vector(per_image, cells):
-    """Pick the comparison unit: per-image losses when there are enough images, else the
-    (image, band) cells. With < 3 images an image-level standard error is meaningless."""
-    if per_image is not None and len(per_image) >= 3:
-        return list(per_image)
-    return list(cells) if cells is not None else list(per_image or [])
+MIN_PAIRED_IMAGES = 3
+
+
+def unit_vector(per_image, cells=None):
+    """The comparison unit is the holdout image. Bands and noises are correlated within an image,
+    so they are not treated as independent samples. ``cells`` is accepted for logging callers and
+    ignored here."""
+    return list(per_image) if per_image is not None else None
 
 
 def should_replace(cand_score, cand_tag, cand_vec, best_score, best_tag, best_vec, k=1.0):
     """Decide whether the candidate replaces the incumbent best checkpoint.
 
-    Falls back to the plain mean comparison when either side has no paired vector (for example,
-    a state restored from an older run) or when the vectors are not comparable.
+    Precedence: non-finite candidate never wins; non-finite incumbent always loses; without
+    comparable vectors of >= MIN_PAIRED_IMAGES images, the plain mean decides (champion rule);
+    a paired gain > k*SE (SE across images) wins; otherwise a smoother/later state wins only if
+    its mean is not worse, so tie replacements can never raise the incumbent's mean.
     """
     if not math.isfinite(cand_score):
         return False
     if not math.isfinite(best_score):
         return True
-    if cand_vec is None or best_vec is None or len(cand_vec) != len(best_vec) or len(cand_vec) < 2:
+    if (cand_vec is None or best_vec is None or len(cand_vec) != len(best_vec)
+            or len(cand_vec) < MIN_PAIRED_IMAGES):
         return cand_score < best_score
     mean, se = paired_stats(cand_vec, best_vec)
     if mean > k * se:
