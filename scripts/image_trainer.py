@@ -24,11 +24,6 @@ FAMILY_EXTRAS = {
     "krea2": ["--select-metric", "mean", "--eval-every", "200", "--edge-band-count", "2", "--edge-band-repeat", "3"],
     "ideogram4": ["--no-ckpt", "--select-metric", "p75", "--eval-every", "200"],
 }
-TASK_EXTRAS = {
-    "98f33b85": ["--select-metric", "p75", "--seed", "2", "--eval-every", "200"],
-    "b5e6a507": ["--select-metric", "worst", "--eval-every", "200"],
-    "dbc41291": ["--ckpt"],
-}
 
 
 def logs_enabled():
@@ -70,7 +65,7 @@ def main():
     cmd = [sys.executable, "/app/trainer/train.py", "--family", family, "--model-dir", model_dir, "--hf-cache", os.path.join(CACHE, "hf_cache"),
            "--baked-dir", "/opt/godtrainer/assets", "--comfy-root", os.environ.get("COMFY_ROOT", "/opt/ComfyUI"), "--dataset", dataset,
            "--out", work, "--deadline-ts", str(deadline)] + RECIPES[family] + COMMON + FAMILY_EXTRAS.get(family, [])\
-          + TASK_EXTRAS.get(a.task_id[:8], []) + extra
+          + extra
     if a.trigger_word:
         cmd += ["--trigger-word", a.trigger_word]
     if logs_enabled():
