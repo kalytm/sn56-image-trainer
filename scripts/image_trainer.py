@@ -18,7 +18,8 @@ RECIPES = {
     "qwen-image": ["--rank", "8", "--lr", "1e-4", "--include", r"transformer_blocks\.\d+\.attn\.(to_q|to_k|to_v|to_out)"],
 }
 COMMON = ["--holdout-frac", "0.1", "--holdout-min", "3", "--holdout-noises", "4", "--eval-every", "300",
-          "--select-rule", "paired", "--select-k", "1.0", "--schedule", "steps", "--eval-count", "8",
+          "--select-rule", "paired", "--select-k", "1.0", "--schedule", "steps", "--eval-count", "6",
+          "--epoch-cap", "5", "--eval-grid-gamma", "1.0", "--extra-members", "1",
           "--lr-final-frac", "0.1", "--ema", "0.99", "--case-cycle", "--balanced-prompts", "--delta-average", "2"]
 FAMILY_EXTRAS = {
     "krea2": ["--select-metric", "mean", "--eval-every", "200", "--edge-band-count", "2", "--edge-band-repeat", "3"],

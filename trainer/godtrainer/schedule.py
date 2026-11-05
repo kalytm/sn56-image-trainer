@@ -8,7 +8,8 @@ fixed multiplier. Here, after a short calibration, the cosine horizon is set in 
 
 where ``train_seconds`` is what remains after the measured cost of every planned evaluation and the
 end-of-member tail (final raw/EMA evaluation and the delta-average evaluation). Evaluations sit on
-a grid that is denser toward the end of the cosine, where the best states are. The deadline always
+a grid whose spacing is set by ``gamma`` (>1 packs points toward the end; the shipped recipe uses 1,
+uniform, because the dev suite found the best states at 35-50% of a time-bound horizon). The deadline always
 wins: optional evaluations are skipped when they cannot finish, and the horizon shrinks (never
 grows, so the LR never rises again) when measured progress falls behind the plan.
 

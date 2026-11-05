@@ -647,21 +647,31 @@ class Trainer:
 
         members = []
         n_members = max(1, cfg.soup)
-        for mi in range(n_members):
+        adaptive = self._extra_members_ok()
+        member0_wall = None
+        mi = 0
+        while True:
+            if mi >= n_members:
+                # D6: extra members are added only after the previous one, if enough time is left
+                if not (adaptive and mi < 1 + cfg.extra_members and self._extra_member_fits(member0_wall)):
+                    break
             if mi > 0:
                 self.lora.reinit(cfg.seed + 1000 * mi)
-            soup_reserve = ((self.holdout_time or 60) * 1.3 + 15) if n_members > 1 else 0
+            soup_reserve = ((self.holdout_time or 60) * 1.3 + 15) if (n_members > 1 or mi > 0) else 0
             available = self.remaining() - cfg.save_reserve - soup_reserve
-
-
             if cfg.retrain_all and n_members == 1:
                 available *= cfg.retrain_phase1_frac
-            budget_end = time.time() + available / (n_members - mi)
+            # fixed soup splits the budget evenly; an adaptive member may use all that is left
+            budget_end = time.time() + (available / (n_members - mi) if mi < n_members else available)
+            m_start = time.time()
             res = self.train_member(guider, extra, mi, budget_end)
+            if mi == 0:
+                member0_wall = time.time() - m_start
+            done, mi = mi, mi + 1
             if res is None:
                 break
             members.append(res)
-            self.summary["members"].append({"member": mi, "score": res[0], "tag": res[1]})
+            self.summary["members"].append({"member": done, "score": res[0], "tag": res[1]})
             if self._better(res[0], res[1], self.best[0], self.best[1]):
                 self.best = (res[0], res[1], [res[2]], self.lora.scale)
                 self.save(self.best[2], self.best[3], self.best[0], self.best[1])
@@ -740,6 +750,31 @@ class Trainer:
         if not ok:
             log(f"cross-fit not applied: {n} images, {member_s:.0f}s per member "
                 f"(needs >= {cfg.crossfit_min_images} images and >= {cfg.crossfit_min_member_s:.0f}s)")
+        return ok
+
+    # --- D6: adaptive extra members ---------------------------------------------------------------
+    def _extra_members_ok(self):
+        """Extra members apply only to a single-member, epoch-capped step schedule: when the epoch
+        cap ends a member early, the remaining time trains another member from a new seed."""
+        cfg = self.cfg
+        return (getattr(cfg, "extra_members", 0) > 0 and cfg.soup <= 1 and not cfg.retrain_all
+                and getattr(cfg, "schedule", "time") == "steps" and cfg.epoch_cap > 0)
+
+    def _extra_member_fits(self, member0_wall):
+        """Another member is trained only if the time left (after the save and soup reserves) is at
+        least ``extra_member_min_frac`` of the first member's wall time, so it can reach a similar
+        number of epochs. Decisions are recorded in the summary."""
+        cfg = self.cfg
+        if not member0_wall:
+            return False
+        soup_reserve = (self.holdout_time or 60) * 1.3 + 15
+        avail = self.remaining() - cfg.save_reserve - soup_reserve
+        need = cfg.extra_member_min_frac * member0_wall
+        ok = avail >= need
+        self.summary.setdefault("extra_members", []).append(
+            {"avail_s": round(avail, 1), "need_s": round(need, 1), "member0_wall_s": round(member0_wall, 1), "added": ok})
+        log(f"extra member {'added' if ok else 'skipped'}: {avail:.0f}s left, needs {need:.0f}s "
+            f"({cfg.extra_member_min_frac:.2f} x member 0's {member0_wall:.0f}s)")
         return ok
 
     @staticmethod

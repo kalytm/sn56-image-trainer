@@ -71,7 +71,7 @@ def parse():
     p.add_argument("--schedule", default="time", choices=["time", "steps"],
                    help="time: cosine over the wall-clock budget, evaluate every --eval-every steps; "
                         "steps: calibrate, then a cosine horizon in optimizer steps (time- and epoch-capped) "
-                        "with a tail-dense evaluation grid and measured evaluation reserves")
+                        "with an evaluation grid (--eval-grid-gamma) and measured evaluation reserves")
     p.add_argument("--calib-steps", type=int, default=25, help="steps measured before planning (--schedule steps)")
     p.add_argument("--epoch-cap", type=float, default=0.0,
                    help="max passes over the image x band case cycle (--schedule steps); 0 = time-bound only")
@@ -95,6 +95,11 @@ def parse():
                         "on common holdout cases, smoother/later states win ties")
     p.add_argument("--select-k", type=float, default=1.0, help="standard errors required by --select-rule paired")
     p.add_argument("--soup", type=int, default=1, help="number of sequentially trained members averaged at the end")
+    p.add_argument("--extra-members", type=int, default=0,
+                   help="D6: with --schedule steps and --epoch-cap, train up to N more members from new seeds while "
+                        "time remains after an epoch-capped member; members and their exact average compete in selection")
+    p.add_argument("--extra-member-min-frac", type=float, default=0.8,
+                   help="add a member only if the time left is at least this fraction of member 0's wall time")
     p.add_argument("--delta-average", type=int, default=1, help="exactly average the latest N evaluated effective deltas")
     p.add_argument("--hflip", action="store_true", help="add mirrored copies of the training images")
     p.add_argument("--crop-aug", type=int, default=0, help="zoom-crop copies per non-holdout image")
@@ -150,6 +155,11 @@ def main():
             raise SystemExit("--crossfit-min-images must be >= 2 and --crossfit-eval-max >= 1")
         if not (math.isfinite(cfg.crossfit_min_member_s) and cfg.crossfit_min_member_s >= 0):
             raise SystemExit("--crossfit-min-member-s must be finite and >= 0")
+    if cfg.extra_members < 0 or not (math.isfinite(cfg.extra_member_min_frac) and cfg.extra_member_min_frac > 0):
+        raise SystemExit("--extra-members must be >= 0 and --extra-member-min-frac finite and > 0")
+    if cfg.extra_members and (cfg.crossfit or cfg.soup > 1 or cfg.retrain_all or cfg.schedule != "steps" or cfg.epoch_cap <= 0):
+        raise SystemExit("--extra-members needs --schedule steps and --epoch-cap > 0, and excludes --crossfit, --soup > 1 "
+                         "and --retrain-all")
     for name in ("epoch_cap", "eval_grid_gamma", "eval_frac_max", "eval_safety", "base_eval_frac"):
         if not math.isfinite(getattr(cfg, name)):
             raise SystemExit(f"--{name.replace('_', '-')} must be finite")
