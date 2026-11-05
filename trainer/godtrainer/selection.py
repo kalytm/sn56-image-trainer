@@ -46,10 +46,9 @@ def paired_stats(candidate, incumbent):
 MIN_PAIRED_IMAGES = 3
 
 
-def unit_vector(per_image, cells=None):
+def unit_vector(per_image):
     """The comparison unit is the holdout image. Bands and noises are correlated within an image,
-    so they are not treated as independent samples. ``cells`` is accepted for logging callers and
-    ignored here."""
+    so they are not treated as independent samples."""
     return list(per_image) if per_image is not None else None
 
 
@@ -59,7 +58,8 @@ def should_replace(cand_score, cand_tag, cand_vec, best_score, best_tag, best_ve
     Precedence: non-finite candidate never wins; non-finite incumbent always loses; without
     comparable vectors of >= MIN_PAIRED_IMAGES images, the plain mean decides (champion rule);
     a paired gain > k*SE (SE across images) wins; otherwise a smoother/later state wins only if
-    its mean is not worse, so tie replacements can never raise the incumbent's mean.
+    its per-image mean is not worse, so tie replacements can never raise the incumbent's mean.
+    Callers must pass arithmetic-mean scores (train.py rejects other metrics with this rule).
     """
     if not math.isfinite(cand_score):
         return False
@@ -72,4 +72,5 @@ def should_replace(cand_score, cand_tag, cand_vec, best_score, best_tag, best_ve
     if mean > k * se:
         return True
     smoother_or_later = parse_tag(cand_tag) >= parse_tag(best_tag)
-    return smoother_or_later and cand_score <= best_score
+    # tie guard on the per-image means themselves, independent of the caller's scalar
+    return smoother_or_later and mean >= 0.0

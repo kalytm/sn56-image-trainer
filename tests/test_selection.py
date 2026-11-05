@@ -52,9 +52,8 @@ def test_falls_back_to_mean_without_vectors():
 
 
 def test_unit_vector_is_per_image_only():
-    assert unit_vector([1, 2, 3], [9] * 48) == [1, 2, 3]
-    assert unit_vector([1, 2], [9] * 32) == [1, 2]
-    assert unit_vector(None, [9] * 32) is None
+    assert unit_vector([1, 2, 3]) == [1, 2, 3]
+    assert unit_vector(None) is None
 
 
 def test_fewer_than_three_images_uses_champion_rule():
@@ -68,3 +67,9 @@ def test_tie_replacements_never_raise_the_incumbent_mean():
     best = [0.100, 0.200, 0.300, 0.400]
     slightly_worse = [0.1001, 0.2001, 0.3001, 0.4001]
     assert not should_replace(0.25001, "deltaavg2@900", slightly_worse, 0.25, "raw@300", best)
+
+
+def test_tie_guard_uses_vector_means_not_the_scalar():
+    # codex 4c009d0 P1: a p75-like scalar must not let a worse mean through
+    best, cand = [0.1, 2.0, 2.0, 2.0], [1.9, 1.9, 1.9, 1.9]
+    assert not should_replace(1.9, "ema@600", cand, 2.0, "raw@300", best)

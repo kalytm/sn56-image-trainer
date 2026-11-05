@@ -332,6 +332,15 @@ class TrainSampler:
         return latent_image
 
 
+class HoldoutAborted(Exception):
+    """A holdout evaluation stopped because its projected finish is past the allowed limit.
+    Its partial losses are discarded; a partial vector is never used as a paired score."""
+
+    def __init__(self, projected_s, done, total):
+        super().__init__(f"projected {projected_s:.0f}s after {done}/{total} units")
+        self.projected_s, self.done, self.total = projected_s, done, total
+
+
 def case_seed(image_hash, band, k, master=42):
     return int.from_bytes(hashlib.sha256(f"{master}:{image_hash}:{band}:{k}".encode()).digest()[:8], "little") % (2**63 - 1)
 
@@ -457,11 +466,14 @@ class Trainer:
         raise ValueError(f"unknown select_metric {metric!r}")
 
     @torch.no_grad()
-    def holdout_score(self, guider, extra):
+    def holdout_score(self, guider, extra, limit=None):
+        """Score the current weights on the holdout. With ``limit`` (a timestamp), the cost is
+        projected after every image x prompt-mode unit and HoldoutAborted is raised as soon as the
+        projected finish passes ``limit``."""
         t0 = time.time()
         per_mode = {"text": [], "no_text": []}
-        cell_modes = {"text": [], "no_text": []}
         band_acc = np.zeros(self.bands)
+        units_total, units_done = 2 * len(self.holdout_items), 0
         for item in self.holdout_items:
             x = item["scaled"].to(self.device)
             for mode in per_mode:
@@ -483,14 +495,18 @@ class Trainer:
                         band_losses += (pred - (noise - x).float()).square().flatten(1).mean(1).tolist()
                     losses += band_losses
                     band_acc[b] += float(np.mean(band_losses))
-                    cell_modes[mode].append(float(np.mean(band_losses)))
                 per_mode[mode].append(float(np.mean(losses)))
+                units_done += 1
+                if limit is not None and units_done < units_total:
+                    projected = (time.time() - t0) / units_done * units_total
+                    if t0 + projected > limit:
+                        raise HoldoutAborted(projected, units_done, units_total)
 
         per_image = [0.5 * t + 0.5 * n for t, n in zip(per_mode["text"], per_mode["no_text"])]
-        cells = [0.5 * t + 0.5 * n for t, n in zip(cell_modes["text"], cell_modes["no_text"])]
-        self.last_holdout_unit = selection.unit_vector(per_image, cells)
+        self.last_holdout_unit = selection.unit_vector(per_image)
         mean_score = float(np.mean(per_image))
-        score = self._aggregate_holdout(per_image)
+        # the paired rule is defined on arithmetic means; other aggregates are champion (min) only
+        score = mean_score if self._paired() else self._aggregate_holdout(per_image)
         self.last_holdout_mean = mean_score
         self.last_holdout_per_image = per_image
         self.holdout_time = time.time() - t0
@@ -514,8 +530,15 @@ class Trainer:
         for tag, st, scale in cands:
             if st is not None:
                 self.lora.set_tensors(st, scale)
-            sc = self.holdout_score(guider, extra)
-            self.lora.restore()
+            try:
+                sc = self.holdout_score(guider, extra, limit=self.eval_limit())
+            except HoldoutAborted as e:
+                log(f"[eval step {step}] {tag}: skipped ({e}); deadline wins")
+                self.summary.setdefault("skipped_evals", []).append({"step": step, "tag": tag})
+                out.append((float("nan"), tag))  # a non-finite score never replaces a checkpoint
+                continue
+            finally:
+                self.lora.restore()
             self.vectors[self._key(tag if "@" in tag else f"{tag}@{step}")] = self.last_holdout_unit
             out.append((sc, tag))
             rel = (sc / self.base_score - 1) * 100 if self.base_score else 0.0
@@ -523,13 +546,20 @@ class Trainer:
             self.summary["evals"].append({"step": step, "tag": tag, "score": sc, "t": time.time()})
         return out
 
+    def eval_limit(self):
+        """Latest time a holdout evaluation may finish: the deadline minus the save reserve."""
+        return self.cfg.deadline_ts - self.cfg.save_reserve
+
     @staticmethod
     def _key(tag):
-        tag = re.sub(r"^m\d+:", "", tag or "")
-        return "base" if tag == "identity" else tag
+        """Vector key. Tags carry the member (``m1:ema@300``) so members never share a key."""
+        return "base" if tag == "identity" else (tag or "")
+
+    def _paired(self):
+        return getattr(self.cfg, "select_rule", "min") == "paired"
 
     def _better(self, score, tag, best_score, best_tag):
-        if getattr(self.cfg, "select_rule", "min") != "paired":
+        if not self._paired():
             return score < best_score
         return selection.should_replace(score, tag, self.vectors.get(self._key(tag)),
                                         best_score, best_tag, self.vectors.get(self._key(best_tag)),
@@ -555,12 +585,23 @@ class Trainer:
             it["scaled"] = it["scaled"].to(self.device)
 
         self.vectors = {}
-        self.base_score = self.holdout_score(guider, extra)
-        self.vectors["base"] = self.last_holdout_unit
-        log(f"base holdout score {self.base_score:.6f} (holdout {len(self.holdout_items)} imgs, {self.holdout_time:.0f}s); train imgs {len(self.train_items)}")
-        self.summary["base_score"] = self.base_score
         ident = [self.lora.state()]
-        self.save(ident, self.lora.scale, self.base_score, "identity")
+        # a valid fallback exists before any long scoring starts
+        self.save(ident, self.lora.scale, float("nan"), "identity")
+        self.base_score = self._base_eval(guider, extra)
+        if self.base_score is None:
+            self.best = (float("nan"), "identity", ident, self.lora.scale)
+            self.summary["final"] = {"best": "identity", "score": None, "base": None, "rel_pct": None,
+                                     "wall_s": time.time() - t_start, "reason": "base evaluation cannot finish"}
+            json.dump(self.summary, open(os.path.join(self.out_dir, "summary.json"), "w"), indent=1)
+            log("final:", json.dumps(self.summary["final"]))
+            return
+        self.vectors["base"] = self.last_holdout_unit
+        log(f"base holdout score {self.base_score:.6f} (holdout {len(self.holdout_items)} imgs, {cfg.holdout_noises} noises, "
+            f"{self.holdout_time:.0f}s); train imgs {len(self.train_items)}")
+        self.summary["base_score"] = self.base_score
+        self.saved_score = self.base_score
+        self.summary["saved"] = {"tag": "identity", "score": self.base_score, "base": self.base_score, "rel_pct": 0.0}
         self.best = (self.base_score, "identity", ident, self.lora.scale)
 
         members = []
@@ -581,7 +622,7 @@ class Trainer:
             members.append(res)
             self.summary["members"].append({"member": mi, "score": res[0], "tag": res[1]})
             if self._better(res[0], res[1], self.best[0], self.best[1]):
-                self.best = (res[0], f"m{mi}:{res[1]}", [res[2]], self.lora.scale)
+                self.best = (res[0], res[1], [res[2]], self.lora.scale)
                 self.save(self.best[2], self.best[3], self.best[0], self.best[1])
         if cfg.retrain_all and len(members) == 1 and self.holdout_items:
             self.retrain_all(guider, extra, members[0])
@@ -598,12 +639,37 @@ class Trainer:
         json.dump(self.summary, open(os.path.join(self.out_dir, "summary.json"), "w"), indent=1)
         log("final:", json.dumps(self.summary["final"]))
 
+    def _base_eval(self, guider, extra):
+        """Base holdout score, bounded by time. If the first units project past
+        ``base_eval_frac`` of the remaining budget, the noise count is reduced (fixed for the rest of
+        the run, so all candidates stay paired) and the evaluation restarts. At one noise it may use
+        the whole budget up to ``eval_limit``; returns None if even that cannot finish."""
+        cfg = self.cfg
+        frac = getattr(cfg, "base_eval_frac", 1.0)
+        while True:
+            start = time.time()
+            last_resort = cfg.holdout_noises <= 1
+            limit = self.eval_limit() if last_resort else start + frac * max(0.0, self.eval_limit() - start)
+            try:
+                return self.holdout_score(guider, extra, limit=limit)
+            except HoldoutAborted as e:
+                if last_resort:
+                    log(f"base evaluation cannot finish before the deadline ({e}); shipping identity")
+                    return None
+                allowed = max(0.0, limit - start)
+                new = max(1, min(cfg.holdout_noises - 1, int(cfg.holdout_noises * allowed / e.projected_s)))
+                log(f"base evaluation with {cfg.holdout_noises} noises projects {e.projected_s:.0f}s > {allowed:.0f}s; "
+                    f"retrying with {new}")
+                self.summary.setdefault("holdout_noise_reductions", []).append(
+                    {"from": cfg.holdout_noises, "to": new, "projected_s": e.projected_s, "allowed_s": allowed})
+                cfg.holdout_noises = new
+
     def retrain_all(self, guider, extra, phase1):
 
 
         cfg = self.cfg
         score1, tag1 = phase1[0], phase1[1]
-        m = re.match(r"(raw|ema)@(\d+)$", tag1)
+        m = re.match(r"(?:m\d+:)?(raw|ema)@(\d+)$", tag1)
         if not m or score1 >= self.base_score:
             log("retrain-all: phase 1 produced no usable best step; skipping")
             return
@@ -784,13 +850,13 @@ class Trainer:
                 eval_s = self.holdout_time or 60
                 if sched.eval_due(step, time.time(), eval_s):
                     last_eval_step = step
-                    best = self._select(guider, extra, lora, ema, best, step)
+                    best = self._select(guider, extra, lora, ema, best, step, mi)
                     history.append(lora.state())
                     if sched.replan(step, time.time(), self.holdout_time or 60):
                         log(f"m{mi} replan at step {step}: horizon {sched.horizon}")
             elif fixed_steps is None and (eval_due or step == cfg.eval_every):
                 last_eval_step = step
-                best = self._select(guider, extra, lora, ema, best, step)
+                best = self._select(guider, extra, lora, ema, best, step, mi)
                 history.append(lora.state())
         if fixed_steps is not None:
             if select == "ema" and ema is not None:
@@ -802,13 +868,13 @@ class Trainer:
             return (float("nan"), f"{select}@{step}", state)
 
         if step > last_eval_step and self.remaining() > cfg.save_reserve + (self.holdout_time or 60) * 2.1:
-            best = self._select(guider, extra, lora, ema, best, step)
+            best = self._select(guider, extra, lora, ema, best, step, mi)
             history.append(lora.state())
         if (cfg.delta_average > 1 and len(history) >= cfg.delta_average
                 and time.time() + (self.holdout_time or 60) * 1.1 < budget_end):
             count = cfg.delta_average
             averaged = soup_tensors(history[-count:], self.device)
-            tag = f"deltaavg{count}@{step}"
+            tag = f"m{mi}:deltaavg{count}@{step}"
             sc = self.evaluate_candidates(guider, extra, [(tag, averaged, lora.scale)], step)[0][0]
             if self._better(sc, tag, best[0], best[1]):
                 state = {n: tuple(q.detach().clone() for q in tensors) for n, tensors in averaged.items()}
@@ -821,16 +887,16 @@ class Trainer:
         log(f"member {mi} done: steps={step} best={best[1]} {best[0]:.6f} ({(best[0] / self.base_score - 1) * 100:+.2f}% vs base)")
         return best
 
-    def _select(self, guider, extra, lora, ema, best, step):
-        cands = [("raw", None, None)]
+    def _select(self, guider, extra, lora, ema, best, step, mi=0):
+        cands = [(f"m{mi}:raw@{step}", None, None)]
         if ema is not None:
             ema_state = lora.state_from_flat(ema)
-            cands.append(("ema", ema_state, lora.scale))
+            cands.append((f"m{mi}:ema@{step}", ema_state, lora.scale))
         scores = self.evaluate_candidates(guider, extra, cands, step)
         for (sc, tag), (_, st, _) in zip(scores, cands):
-            if self._better(sc, f"{tag}@{step}", best[0], best[1]):
+            if self._better(sc, tag, best[0], best[1]):
                 state = lora.state() if st is None else {n: (u.detach().clone(), d.detach().clone()) for n, (u, d) in st.items()}
-                best = (sc, f"{tag}@{step}", state)
+                best = (sc, tag, state)
                 if self._better(sc, best[1], self.best[0], self.best[1]):
                     self.best = (sc, best[1], [state], lora.scale)
                     self.save([state], lora.scale, sc, best[1])

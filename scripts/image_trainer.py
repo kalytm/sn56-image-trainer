@@ -22,7 +22,7 @@ COMMON = ["--holdout-frac", "0.1", "--holdout-min", "3", "--holdout-noises", "4"
           "--lr-final-frac", "0.1", "--ema", "0.99", "--case-cycle", "--balanced-prompts", "--delta-average", "2"]
 FAMILY_EXTRAS = {
     "krea2": ["--select-metric", "mean", "--eval-every", "200", "--edge-band-count", "2", "--edge-band-repeat", "3"],
-    "ideogram4": ["--no-ckpt", "--select-metric", "p75", "--eval-every", "200"],
+    "ideogram4": ["--no-ckpt", "--eval-every", "200"],
 }
 
 

@@ -1,6 +1,7 @@
 import argparse
 import gc
 import json
+import math
 import os
 import random
 import sys
@@ -78,6 +79,8 @@ def parse():
     p.add_argument("--eval-grid-gamma", type=float, default=2.0, help=">1 packs evaluations toward the end of the cosine")
     p.add_argument("--eval-frac-max", type=float, default=0.35, help="max share of member time spent on in-loop evaluations")
     p.add_argument("--eval-safety", type=float, default=1.2, help="multiplier on measured evaluation time when reserving")
+    p.add_argument("--base-eval-frac", type=float, default=0.15,
+                   help="max share of the remaining budget for the base holdout; above it the noise count is reduced")
     p.add_argument("--select-metric", default="mean", choices=["mean", "worst", "p75"],
                    help="holdout aggregate for checkpoint picking; official score is always the mean")
     p.add_argument("--select-rule", default="min", choices=["min", "paired"],
@@ -127,6 +130,17 @@ def main():
         raise SystemExit("--edge-band-repeat must be at least 1")
     if cfg.delta_average < 1:
         raise SystemExit("--delta-average must be at least 1")
+    if not math.isfinite(cfg.select_k) or cfg.select_k < 0:
+        raise SystemExit("--select-k must be finite and >= 0")
+    if cfg.select_rule == "paired" and cfg.select_metric != "mean":
+        raise SystemExit("--select-rule paired compares arithmetic means; use --select-metric mean")
+    if not 0 < cfg.base_eval_frac <= 1:
+        raise SystemExit("--base-eval-frac must be in (0, 1]")
+    if cfg.schedule == "steps":
+        if cfg.calib_steps < 1 or cfg.eval_count < 1 or cfg.epoch_cap < 0:
+            raise SystemExit("--calib-steps and --eval-count must be >= 1, --epoch-cap >= 0")
+        if not (cfg.eval_grid_gamma > 0 and 0 < cfg.eval_frac_max < 1 and cfg.eval_safety >= 1):
+            raise SystemExit("need --eval-grid-gamma > 0, 0 < --eval-frac-max < 1, --eval-safety >= 1")
     if cfg.alpha is None:
         cfg.alpha = float(cfg.rank)
     if cfg.deadline_ts is None:
