@@ -13,6 +13,7 @@ import torch
 from safetensors.torch import save_file
 
 from . import assets as A
+from . import selection
 
 LOG = print
 
@@ -459,6 +460,7 @@ class Trainer:
     def holdout_score(self, guider, extra):
         t0 = time.time()
         per_mode = {"text": [], "no_text": []}
+        cell_modes = {"text": [], "no_text": []}
         band_acc = np.zeros(self.bands)
         for item in self.holdout_items:
             x = item["scaled"].to(self.device)
@@ -481,9 +483,12 @@ class Trainer:
                         band_losses += (pred - (noise - x).float()).square().flatten(1).mean(1).tolist()
                     losses += band_losses
                     band_acc[b] += float(np.mean(band_losses))
+                    cell_modes[mode].append(float(np.mean(band_losses)))
                 per_mode[mode].append(float(np.mean(losses)))
 
         per_image = [0.5 * t + 0.5 * n for t, n in zip(per_mode["text"], per_mode["no_text"])]
+        cells = [0.5 * t + 0.5 * n for t, n in zip(cell_modes["text"], cell_modes["no_text"])]
+        self.last_holdout_unit = selection.unit_vector(per_image, cells)
         mean_score = float(np.mean(per_image))
         score = self._aggregate_holdout(per_image)
         self.last_holdout_mean = mean_score
@@ -511,11 +516,24 @@ class Trainer:
                 self.lora.set_tensors(st, scale)
             sc = self.holdout_score(guider, extra)
             self.lora.restore()
+            self.vectors[self._key(tag if "@" in tag else f"{tag}@{step}")] = self.last_holdout_unit
             out.append((sc, tag))
             rel = (sc / self.base_score - 1) * 100 if self.base_score else 0.0
             log(f"[eval step {step}] {tag}: {sc:.6f} ({rel:+.2f}% vs base) holdout_time={self.holdout_time:.0f}s")
             self.summary["evals"].append({"step": step, "tag": tag, "score": sc, "t": time.time()})
         return out
+
+    @staticmethod
+    def _key(tag):
+        tag = re.sub(r"^m\d+:", "", tag or "")
+        return "base" if tag == "identity" else tag
+
+    def _better(self, score, tag, best_score, best_tag):
+        if getattr(self.cfg, "select_rule", "min") != "paired":
+            return score < best_score
+        return selection.should_replace(score, tag, self.vectors.get(self._key(tag)),
+                                        best_score, best_tag, self.vectors.get(self._key(best_tag)),
+                                        k=self.cfg.select_k)
 
     def save(self, states, scale, score, tag):
         os.makedirs(self.out_dir, exist_ok=True)
@@ -536,7 +554,9 @@ class Trainer:
         for it in self.items:
             it["scaled"] = it["scaled"].to(self.device)
 
+        self.vectors = {}
         self.base_score = self.holdout_score(guider, extra)
+        self.vectors["base"] = self.last_holdout_unit
         log(f"base holdout score {self.base_score:.6f} (holdout {len(self.holdout_items)} imgs, {self.holdout_time:.0f}s); train imgs {len(self.train_items)}")
         self.summary["base_score"] = self.base_score
         ident = [self.lora.state()]
@@ -560,7 +580,7 @@ class Trainer:
                 break
             members.append(res)
             self.summary["members"].append({"member": mi, "score": res[0], "tag": res[1]})
-            if res[0] < self.best[0]:
+            if self._better(res[0], res[1], self.best[0], self.best[1]):
                 self.best = (res[0], f"m{mi}:{res[1]}", [res[2]], self.lora.scale)
                 self.save(self.best[2], self.best[3], self.best[0], self.best[1])
         if cfg.retrain_all and len(members) == 1 and self.holdout_items:
@@ -568,10 +588,11 @@ class Trainer:
         if len(members) > 1 and self.remaining() > cfg.save_reserve * 0.5 + (self.holdout_time or 60) * 1.1:
             states = [m[2] for m in members]
             soup = soup_tensors(states, self.device)
-            sc = self.evaluate_candidates(guider, extra, [("soup", soup, self.lora.scale)], self.summary["steps"])[0][0]
-            if sc < self.best[0]:
-                self.best = (sc, "soup", states, self.lora.scale)
-                self.save(states, self.lora.scale, sc, "soup")
+            soup_tag = f"soup@{self.summary['steps']}"
+            sc = self.evaluate_candidates(guider, extra, [(soup_tag, soup, self.lora.scale)], self.summary["steps"])[0][0]
+            if self._better(sc, soup_tag, self.best[0], self.best[1]):
+                self.best = (sc, soup_tag, states, self.lora.scale)
+                self.save(states, self.lora.scale, sc, soup_tag)
         self.summary["final"] = {"best": self.best[1], "score": self.best[0], "base": self.base_score, "rel_pct": (self.best[0] / self.base_score - 1) * 100,
                                  "wall_s": time.time() - t_start}
         json.dump(self.summary, open(os.path.join(self.out_dir, "summary.json"), "w"), indent=1)
@@ -762,10 +783,10 @@ class Trainer:
             averaged = soup_tensors(history[-count:], self.device)
             tag = f"deltaavg{count}@{step}"
             sc = self.evaluate_candidates(guider, extra, [(tag, averaged, lora.scale)], step)[0][0]
-            if sc < best[0]:
+            if self._better(sc, tag, best[0], best[1]):
                 state = {n: tuple(q.detach().clone() for q in tensors) for n, tensors in averaged.items()}
                 best = (sc, tag, state)
-                if sc < self.best[0]:
+                if self._better(sc, tag, self.best[0], self.best[1]):
                     self.best = (sc, tag, [state], lora.scale)
                     self.save([state], lora.scale, sc, tag)
         log(f"member {mi} done: steps={step} best={best[1]} {best[0]:.6f} ({(best[0] / self.base_score - 1) * 100:+.2f}% vs base)")
@@ -778,10 +799,10 @@ class Trainer:
             cands.append(("ema", ema_state, lora.scale))
         scores = self.evaluate_candidates(guider, extra, cands, step)
         for (sc, tag), (_, st, _) in zip(scores, cands):
-            if sc < best[0]:
+            if self._better(sc, f"{tag}@{step}", best[0], best[1]):
                 state = lora.state() if st is None else {n: (u.detach().clone(), d.detach().clone()) for n, (u, d) in st.items()}
                 best = (sc, f"{tag}@{step}", state)
-                if sc < self.best[0]:
+                if self._better(sc, best[1], self.best[0], self.best[1]):
                     self.best = (sc, best[1], [state], lora.scale)
                     self.save([state], lora.scale, sc, best[1])
         return best

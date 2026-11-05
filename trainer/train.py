@@ -69,6 +69,10 @@ def parse():
     p.add_argument("--eval-every", type=int, default=150)
     p.add_argument("--select-metric", default="mean", choices=["mean", "worst", "p75"],
                    help="holdout aggregate for checkpoint picking; official score is always the mean")
+    p.add_argument("--select-rule", default="min", choices=["min", "paired"],
+                   help="min: replace best on any lower holdout mean; paired: require a paired gain > k*SE "
+                        "on common holdout cases, smoother/later states win ties")
+    p.add_argument("--select-k", type=float, default=1.0, help="standard errors required by --select-rule paired")
     p.add_argument("--soup", type=int, default=1, help="number of sequentially trained members averaged at the end")
     p.add_argument("--delta-average", type=int, default=1, help="exactly average the latest N evaluated effective deltas")
     p.add_argument("--hflip", action="store_true", help="add mirrored copies of the training images")
