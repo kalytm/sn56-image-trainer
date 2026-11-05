@@ -13,7 +13,7 @@ import torch
 from safetensors.torch import save_file
 
 from . import assets as A
-from . import selection
+from . import schedule, selection
 
 LOG = print
 
@@ -659,6 +659,14 @@ class Trainer:
         step, order, band_perm, cases, bi = 0, [], [], [], 0
         last_eval_step = 0
         gen = torch.Generator(device="cpu").manual_seed(cfg.seed + 7919 * mi)
+        sched = None
+        if fixed_steps is None and getattr(cfg, "schedule", "time") == "steps":
+            n_cases = len(self.train_items) * max(1, len(self.training_bands(cfg.band_max)))
+            sched = schedule.StepSchedule(
+                budget_end, n_cases, epoch_cap=cfg.epoch_cap, max_evals=cfg.eval_count,
+                calib_steps=cfg.calib_steps, gamma=cfg.eval_grid_gamma, eval_frac_max=cfg.eval_frac_max,
+                safety=cfg.eval_safety, cands_per_eval=2 if ema is not None else 1,
+                tail_extra_evals=1 if cfg.delta_average > 1 else 0)
         while True:
             now = time.time()
             est_step = self.step_time or 3.0
@@ -667,6 +675,16 @@ class Trainer:
                     break
                 eval_due = False
                 p = min(1.0, step / max(1, fixed_steps))
+            elif sched is not None:
+                eval_s = self.holdout_time or 60
+                if sched.maybe_plan(step, now, eval_s):
+                    log(f"m{mi} step schedule: {json.dumps(sched.planned)} grid={sched.grid}")
+                elif sched.horizon is not None and step % sched.calib_steps == 0 and sched.replan(step, now, eval_s):
+                    log(f"m{mi} replan at step {step}: horizon {sched.horizon}")
+                if sched.should_stop(step, now, eval_s):
+                    break
+                eval_due = False
+                p = sched.progress(step)
             else:
                 eval_due = (step - last_eval_step) >= cfg.eval_every
                 eval_count = 3.3 if cfg.delta_average > 1 else 2.2
@@ -761,7 +779,16 @@ class Trainer:
             self.summary["steps"] += 1
             if step % 25 == 0:
                 log(f"m{mi} step {step} loss {loss.item():.4f} band {band} lr {lr:.2e} step_t {self.step_time:.2f}s left {budget_end - time.time():.0f}s")
-            if fixed_steps is None and (eval_due or step == cfg.eval_every):
+            if sched is not None:
+                sched.observe_step(dt)
+                eval_s = self.holdout_time or 60
+                if sched.eval_due(step, time.time(), eval_s):
+                    last_eval_step = step
+                    best = self._select(guider, extra, lora, ema, best, step)
+                    history.append(lora.state())
+                    if sched.replan(step, time.time(), self.holdout_time or 60):
+                        log(f"m{mi} replan at step {step}: horizon {sched.horizon}")
+            elif fixed_steps is None and (eval_due or step == cfg.eval_every):
                 last_eval_step = step
                 best = self._select(guider, extra, lora, ema, best, step)
                 history.append(lora.state())
@@ -789,6 +816,8 @@ class Trainer:
                 if self._better(sc, tag, self.best[0], self.best[1]):
                     self.best = (sc, tag, [state], lora.scale)
                     self.save([state], lora.scale, sc, tag)
+        if sched is not None:
+            self.summary.setdefault("schedules", []).append({"member": mi, "steps": step, **sched.summary()})
         log(f"member {mi} done: steps={step} best={best[1]} {best[0]:.6f} ({(best[0] / self.base_score - 1) * 100:+.2f}% vs base)")
         return best
 

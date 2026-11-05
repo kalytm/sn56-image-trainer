@@ -67,6 +67,17 @@ def parse():
     p.add_argument("--holdout-folds", type=int, default=0, help="deterministic K-fold split; 0 uses frac/min")
     p.add_argument("--holdout-fold", type=int, default=0)
     p.add_argument("--eval-every", type=int, default=150)
+    p.add_argument("--schedule", default="time", choices=["time", "steps"],
+                   help="time: cosine over the wall-clock budget, evaluate every --eval-every steps; "
+                        "steps: calibrate, then a cosine horizon in optimizer steps (time- and epoch-capped) "
+                        "with a tail-dense evaluation grid and measured evaluation reserves")
+    p.add_argument("--calib-steps", type=int, default=25, help="steps measured before planning (--schedule steps)")
+    p.add_argument("--epoch-cap", type=float, default=0.0,
+                   help="max passes over the image x band case cycle (--schedule steps); 0 = time-bound only")
+    p.add_argument("--eval-count", type=int, default=8, help="evaluation points per member incl. the final one (--schedule steps)")
+    p.add_argument("--eval-grid-gamma", type=float, default=2.0, help=">1 packs evaluations toward the end of the cosine")
+    p.add_argument("--eval-frac-max", type=float, default=0.35, help="max share of member time spent on in-loop evaluations")
+    p.add_argument("--eval-safety", type=float, default=1.2, help="multiplier on measured evaluation time when reserving")
     p.add_argument("--select-metric", default="mean", choices=["mean", "worst", "p75"],
                    help="holdout aggregate for checkpoint picking; official score is always the mean")
     p.add_argument("--select-rule", default="min", choices=["min", "paired"],
