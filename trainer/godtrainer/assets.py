@@ -1,6 +1,7 @@
 import glob
 import json
 import os
+import struct
 
 import torch
 from safetensors.torch import load_file
@@ -72,6 +73,22 @@ def sub_dict(sd, prefix):
     return {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
 
 
+def safetensors_keys(path):
+    """Tensor names from a safetensors header, without loading any tensor."""
+    with open(path, "rb") as f:
+        (n,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(n))
+    return [k for k in header if k != "__metadata__"]
+
+
+# Standalone FLUX checkpoints (a bare transformer file) get their text encoders and VAE from the
+# artifacts the validator downloads next to the model (trainer/runtime.py sets these env vars); they
+# are the same files the official evaluator loads for every FLUX task (image_flow_adapter.py).
+FLUX_ARTIFACTS = {"clip_l": ("FLUX_CLIP_PATH", "clip_l.safetensors"),
+                  "t5xxl": ("FLUX_T5_PATH", "t5xxl_fp16.safetensors"),
+                  "vae": ("FLUX_VAE_PATH", "ae.safetensors")}
+
+
 class Assets:
 
 
@@ -80,11 +97,31 @@ class Assets:
         self.family, self.model_dir, self.hf_cache, self.baked_dir = family, model_dir, hf_cache, baked_dir
         self.diffusion_checkpoint = diffusion_checkpoint
         self._ckpt = None
+        self._standalone = None
 
     def _full_checkpoint(self):
         if self._ckpt is None:
             self._ckpt = load_sharded(_root_safetensors(self.model_dir)[:1])
         return self._ckpt
+
+    def flux_standalone(self):
+        """True for a FLUX model dir holding a bare transformer checkpoint (no bundled VAE/encoders)."""
+        if self.family != "flux":
+            return False
+        if self._standalone is None:
+            roots = _root_safetensors(self.model_dir)
+            if not roots:
+                raise FileNotFoundError(f"no flux checkpoint under {self.model_dir}")
+            keys = safetensors_keys(roots[0])
+            self._standalone = not any(k.startswith("model.diffusion_model.") for k in keys)
+        return self._standalone
+
+    def flux_artifact(self, part):
+        env, name = FLUX_ARTIFACTS[part]
+        path = os.environ.get(env) or os.path.join(self.hf_cache or "", name)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"standalone FLUX needs {name} ({env}); not found at {path}")
+        return path
 
     def diffusion_sd(self):
         if self.diffusion_checkpoint:
@@ -101,6 +138,8 @@ class Assets:
         if f == "ideogram4":
             return dequant_per_row_fp8(load_sharded(_shards(os.path.join(self.model_dir, "transformer"))), requant_fp8=True)
         if f == "flux":
+            if self.flux_standalone():
+                return to_bf16(self._full_checkpoint())
             return to_bf16(sub_dict(self._full_checkpoint(), "model.diffusion_model."))
         roots = _root_safetensors(self.model_dir)
         if f == "krea2":
@@ -133,6 +172,8 @@ class Assets:
             return [load_sharded(_shards(hf_snapshot_dir(self.hf_cache, "Qwen/Qwen3-VL-8B-Instruct")))]
         if f in ("qwen-image", "z-image"):
             return [load_sharded(_shards(os.path.join(self.model_dir, "text_encoder")))]
+        if self.flux_standalone():
+            return [load_file(self.flux_artifact("clip_l"), device="cpu"), load_file(self.flux_artifact("t5xxl"), device="cpu")]
         ck = self._full_checkpoint()
         return [sub_dict(ck, "text_encoders.clip_l.transformer."), sub_dict(ck, "text_encoders.t5xxl.transformer.")]
 
@@ -142,6 +183,8 @@ class Assets:
         if f == "z-image":
             return "diffusers", os.path.join(self.model_dir, "vae")
         if f == "flux":
+            if self.flux_standalone():
+                return "comfy", load_file(self.flux_artifact("vae"), device="cpu")
             return "comfy", sub_dict(self._full_checkpoint(), "vae.")
         name = "flux2-vae.safetensors" if f == "ideogram4" else "qwen_image_vae.safetensors"
         return "comfy", load_file(os.path.join(self.baked_dir, name), device="cpu")
