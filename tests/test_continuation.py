@@ -101,9 +101,28 @@ def test_after_an_extra_member_only_one_continuation_and_soup_excludes_it(clock,
 ])
 def test_validation(tmp_path, extra, ok):
     r = run_train_validation(["--extra-members", "1", "--schedule", "steps", "--epoch-cap", "5"] + extra, tmp_path)
-    assert (r.returncode == 0 or "--continue" not in r.stderr) if ok else ("--continue" in r.stderr)
+    if ok:
+        assert "No module named 'torch'" in r.stderr  # validation passed; stopped at the GPU import
+    else:
+        assert r.returncode and "--continue" in r.stderr
 
 
 def test_continuation_needs_extra_members(tmp_path):
     r = run_train_validation(["--continue-lr-frac", "0.3"], tmp_path)
     assert r.returncode and "--continue-lr-frac needs --extra-members" in r.stderr
+
+
+@pytest.mark.parametrize("kind", ["deltaavg2", "soup"])
+def test_averaged_incumbent_is_not_continued(clock, tmp_path, kind):  # noqa: F811
+    t = make(clock, tmp_path, **cfg())
+    calls = []
+
+    def member(guider, extra, mi, budget_end, lr_scale=1.0):
+        calls.append(mi)
+        clock.t = min(budget_end, clock.t + 2000.0)
+        t.summary["steps"] += 1680
+        return (0.40, f"m{mi}:{kind}@1680", {"m": mi})
+    t.train_member = member
+    t.run(None, None)
+    assert calls == [0] and t.summary["continuation"][0]["at_end"] is False
+    assert not t.lora.load_state.called

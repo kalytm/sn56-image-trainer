@@ -33,6 +33,22 @@ class _OutOfMemoryError(RuntimeError):
 _torch.cuda.OutOfMemoryError = _OutOfMemoryError
 _torch.cuda.is_available = lambda: True  # the existing tests take the CUDA-sync path (mocked)
 _torch.cuda.empty_cache = lambda: None
+
+
+class _AdamW:
+    """Stand-in optimizer with the old mock's behaviour (no param groups; step/zero_grad no-ops)."""
+
+    def __init__(self, *a, **k):
+        self.param_groups = []
+
+    def step(self):
+        pass
+
+    def zero_grad(self, set_to_none=True):
+        pass
+
+
+_torch.optim.AdamW = _AdamW
 sys.modules.setdefault("torch", _torch)
 for name in ("safetensors", "safetensors.torch"):
     sys.modules.setdefault(name, types.ModuleType(name))

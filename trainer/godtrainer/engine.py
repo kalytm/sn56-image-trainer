@@ -796,23 +796,27 @@ class Trainer:
 
     def _continuation_fits(self, final_steps, member0_wall):
         """D8: when no further member fits, continue the incumbent once, from its weights, with a new
-        short cosine at ``continue_lr_frac`` of the LR, if (1) the incumbent is a single member's
-        state from that member's final step (the holdout was still improving when its schedule
-        ended) and (2) the time left after the save and soup reserves is at least
-        ``continue_min_frac`` of member 0's wall time. The continuation is a candidate like any
-        member: it replaces the incumbent only under the D1 rule. Decisions are recorded."""
+        short cosine at ``continue_lr_frac`` of the LR, if (1) the incumbent is a single member's raw
+        or EMA state tagged at that member's final step (a heuristic for "the schedule ended while
+        the holdout was still improving"; D1 can also accept an equal-mean later state) and (2) the
+        time left after the save and soup reserves is at least ``continue_min_frac`` of member 0's
+        wall time. Delta-average and soup states are not eligible: they are exact averages stored
+        as rank-concatenated factors, which do not fit the trainable rank. The continuation is a
+        candidate like any member: it replaces the incumbent only under the D1 rule. Decisions are
+        recorded."""
         cfg = self.cfg
         if not (getattr(cfg, "continue_lr_frac", 0) > 0 and member0_wall):
             return False
-        m = re.fullmatch(r"m(\d+):[a-z0-9]+@(\d+)", str(self.best[1]))
-        at_end = bool(m) and int(m.group(2)) > 0 and final_steps.get(int(m.group(1))) == int(m.group(2))
+        m = re.fullmatch(r"m(\d+):(raw|ema)@(\d+)", str(self.best[1]))
+        at_end = bool(m) and int(m.group(3)) > 0 and final_steps.get(int(m.group(1))) == int(m.group(3))
         soup_reserve = (self.holdout_time or 60) * 1.3 + 15
         avail = self.remaining() - cfg.save_reserve - soup_reserve
         need = cfg.continue_min_frac * member0_wall
         ok = at_end and avail >= need
         self.summary.setdefault("continuation", []).append(
             {"from": self.best[1], "at_end": at_end, "avail_s": round(avail, 1), "need_s": round(need, 1), "added": ok})
-        log(f"continuation {'added' if ok else 'skipped'}: best {self.best[1]} "
+        why = ("" if m else " (only a single member's raw/EMA state can be continued)")
+        log(f"continuation {'added' if ok else 'skipped'}: best {self.best[1]}{why} "
             f"{'at' if at_end else 'not at'} its member's final step, {avail:.0f}s left, needs {need:.0f}s")
         return ok
 
