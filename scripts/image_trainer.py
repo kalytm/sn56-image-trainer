@@ -25,6 +25,9 @@ COMMON = ["--holdout-frac", "0.1", "--holdout-min", "3", "--holdout-noises", "4"
 FAMILY_EXTRAS = {
     "krea2": ["--select-metric", "mean", "--eval-every", "200", "--edge-band-count", "2", "--edge-band-repeat", "3"],
     "ideogram4": ["--no-ckpt", "--eval-every", "200"],
+    # D9: qwen-image keeps improving on the holdout to ~13 passes (dev 3d5f45ab, B2 and C), so no epoch cap;
+    # without the cap the adaptive member loop (D6/D8) has nothing to fill. Later flags override COMMON.
+    "qwen-image": ["--epoch-cap", "0", "--extra-members", "0", "--continue-lr-frac", "0"],
 }
 
 

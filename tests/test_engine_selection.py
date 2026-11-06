@@ -164,3 +164,22 @@ def test_train_rejects_paired_rule_with_non_mean_metric(tmp_path):
     assert r.returncode != 0 and "--select-k" in r.stderr
     r = run_train_validation(recipe_args("ideogram4"), tmp_path)
     assert "No module named 'torch'" in r.stderr  # validation passed; stopped at the GPU import
+
+
+def flag(args, name):
+    return [args[i + 1] for i, a in enumerate(args) if a == name][-1]  # argparse: the last occurrence wins
+
+
+@pytest.mark.parametrize("family", ["krea2", "ideogram4", "z-image", "flux", "qwen-image"])
+def test_d9_epoch_cap_per_family(family):
+    args = recipe_args(family)
+    if family == "qwen-image":
+        assert (flag(args, "--epoch-cap"), flag(args, "--extra-members"), flag(args, "--continue-lr-frac")) == ("0", "0", "0")
+    else:
+        assert (flag(args, "--epoch-cap"), flag(args, "--extra-members"), flag(args, "--continue-lr-frac")) == ("5", "1", "0.3")
+
+
+@pytest.mark.parametrize("family", ["krea2", "ideogram4", "z-image", "flux", "qwen-image"])
+def test_d9_every_shipped_recipe_passes_train_validation(family, tmp_path):
+    r = run_train_validation(recipe_args(family), tmp_path)
+    assert "No module named 'torch'" in r.stderr, r.stderr[-400:]
