@@ -650,13 +650,23 @@ class Trainer:
         n_members = max(1, cfg.soup)
         adaptive = self._extra_members_ok()
         member0_wall = None
+        final_steps = {}
+        continued = False
         mi = 0
         while True:
+            cont = False
             if mi >= n_members:
-                # D6: extra members are added only after the previous one, if enough time is left
-                if not (adaptive and mi < 1 + cfg.extra_members and self._extra_member_fits(member0_wall)):
+                # D6: extra members are added only after the previous one, if enough time is left;
+                # D8: otherwise the best state may be continued once with a short low-LR restart
+                if adaptive and mi < 1 + cfg.extra_members and self._extra_member_fits(member0_wall):
+                    pass
+                elif adaptive and not continued and self._continuation_fits(final_steps, member0_wall):
+                    cont = continued = True
+                else:
                     break
-            if mi > 0:
+            if cont:
+                self.lora.load_state(self.best[2][0])
+            elif mi > 0:
                 self.lora.reinit(cfg.seed + 1000 * mi)
             soup_reserve = ((self.holdout_time or 60) * 1.3 + 15) if (n_members > 1 or mi > 0) else 0
             available = self.remaining() - cfg.save_reserve - soup_reserve
@@ -665,14 +675,20 @@ class Trainer:
             # fixed soup splits the budget evenly; an adaptive member may use all that is left
             budget_end = time.time() + (available / (n_members - mi) if mi < n_members else available)
             m_start = time.time()
-            res = self.train_member(guider, extra, mi, budget_end)
+            steps_before = self.summary["steps"]
+            if cont:
+                res = self.train_member(guider, extra, mi, budget_end, lr_scale=cfg.continue_lr_frac)
+            else:
+                res = self.train_member(guider, extra, mi, budget_end)
             if mi == 0:
                 member0_wall = time.time() - m_start
+            final_steps[mi] = self.summary["steps"] - steps_before
             done, mi = mi, mi + 1
             if res is None:
                 break
-            members.append(res)
-            self.summary["members"].append({"member": done, "score": res[0], "tag": res[1]})
+            if not cont:  # a continuation starts from a member's weights, so it is never averaged in a soup
+                members.append(res)
+            self.summary["members"].append({"member": done, "score": res[0], "tag": res[1], "continuation": cont})
             if self._better(res[0], res[1], self.best[0], self.best[1]):
                 self.best = (res[0], res[1], [res[2]], self.lora.scale)
                 self.save(self.best[2], self.best[3], self.best[0], self.best[1])
@@ -776,6 +792,28 @@ class Trainer:
             {"avail_s": round(avail, 1), "need_s": round(need, 1), "member0_wall_s": round(member0_wall, 1), "added": ok})
         log(f"extra member {'added' if ok else 'skipped'}: {avail:.0f}s left, needs {need:.0f}s "
             f"({cfg.extra_member_min_frac:.2f} x member 0's {member0_wall:.0f}s)")
+        return ok
+
+    def _continuation_fits(self, final_steps, member0_wall):
+        """D8: when no further member fits, continue the incumbent once, from its weights, with a new
+        short cosine at ``continue_lr_frac`` of the LR, if (1) the incumbent is a single member's
+        state from that member's final step (the holdout was still improving when its schedule
+        ended) and (2) the time left after the save and soup reserves is at least
+        ``continue_min_frac`` of member 0's wall time. The continuation is a candidate like any
+        member: it replaces the incumbent only under the D1 rule. Decisions are recorded."""
+        cfg = self.cfg
+        if not (getattr(cfg, "continue_lr_frac", 0) > 0 and member0_wall):
+            return False
+        m = re.fullmatch(r"m(\d+):[a-z0-9]+@(\d+)", str(self.best[1]))
+        at_end = bool(m) and int(m.group(2)) > 0 and final_steps.get(int(m.group(1))) == int(m.group(2))
+        soup_reserve = (self.holdout_time or 60) * 1.3 + 15
+        avail = self.remaining() - cfg.save_reserve - soup_reserve
+        need = cfg.continue_min_frac * member0_wall
+        ok = at_end and avail >= need
+        self.summary.setdefault("continuation", []).append(
+            {"from": self.best[1], "at_end": at_end, "avail_s": round(avail, 1), "need_s": round(need, 1), "added": ok})
+        log(f"continuation {'added' if ok else 'skipped'}: best {self.best[1]} "
+            f"{'at' if at_end else 'not at'} its member's final step, {avail:.0f}s left, needs {need:.0f}s")
         return ok
 
     @staticmethod
@@ -923,7 +961,7 @@ class Trainer:
                 eval_s * (3.3 if self.cfg.delta_average > 1 else 2.2) + 5
         return time.time() + 1.5 * max(failed_s, est) + reserve <= budget_end
 
-    def train_member(self, guider, extra, mi, budget_end, fixed_steps=None, select=None):
+    def train_member(self, guider, extra, mi, budget_end, fixed_steps=None, select=None, lr_scale=1.0):
 
 
         cfg = self.cfg
@@ -987,7 +1025,7 @@ class Trainer:
 
                 p = min(1.0, (now - t0) / max(1.0, budget_end - t0))
             warm = min(1.0, (step + 1) / max(1, cfg.warmup_steps))
-            lr = cfg.lr * warm * (cfg.lr_final_frac + (1 - cfg.lr_final_frac) * 0.5 * (1 + math.cos(math.pi * p)))
+            lr = cfg.lr * lr_scale * warm * (cfg.lr_final_frac + (1 - cfg.lr_final_frac) * 0.5 * (1 + math.cos(math.pi * p)))
             for g in opt.param_groups:
                 g["lr"] = lr * g["lr_mult"]
             t_iter = time.time()  # full iteration: case/noise preparation through the EMA update

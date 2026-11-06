@@ -100,6 +100,11 @@ def parse():
                         "time remains after an epoch-capped member; members and their exact average compete in selection")
     p.add_argument("--extra-member-min-frac", type=float, default=0.8,
                    help="add a member only if the time left is at least this fraction of member 0's wall time")
+    p.add_argument("--continue-lr-frac", type=float, default=0.0,
+                   help="D8: if no further member fits and the best state is a member's final step, continue it once "
+                        "with a new cosine at this fraction of the LR (0 disables; needs --extra-members)")
+    p.add_argument("--continue-min-frac", type=float, default=0.25,
+                   help="D8: continue only if the time left is at least this fraction of member 0's wall time")
     p.add_argument("--delta-average", type=int, default=1, help="exactly average the latest N evaluated effective deltas")
     p.add_argument("--hflip", action="store_true", help="add mirrored copies of the training images")
     p.add_argument("--crop-aug", type=int, default=0, help="zoom-crop copies per non-holdout image")
@@ -160,6 +165,11 @@ def main():
     if cfg.extra_members and (cfg.crossfit or cfg.soup > 1 or cfg.retrain_all or cfg.schedule != "steps" or cfg.epoch_cap <= 0):
         raise SystemExit("--extra-members needs --schedule steps and --epoch-cap > 0, and excludes --crossfit, --soup > 1 "
                          "and --retrain-all")
+    if not (math.isfinite(cfg.continue_lr_frac) and 0 <= cfg.continue_lr_frac <= 1
+            and math.isfinite(cfg.continue_min_frac) and cfg.continue_min_frac > 0):
+        raise SystemExit("--continue-lr-frac must be in [0, 1] and --continue-min-frac finite and > 0")
+    if cfg.continue_lr_frac > 0 and not cfg.extra_members:
+        raise SystemExit("--continue-lr-frac needs --extra-members (the epoch-capped adaptive member loop)")
     for name in ("epoch_cap", "eval_grid_gamma", "eval_frac_max", "eval_safety", "base_eval_frac"):
         if not math.isfinite(getattr(cfg, name)):
             raise SystemExit(f"--{name.replace('_', '-')} must be finite")
