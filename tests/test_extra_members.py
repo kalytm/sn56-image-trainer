@@ -120,9 +120,10 @@ def test_train_rejects_invalid_extra_member_settings(tmp_path, args, msg):
     assert r.returncode != 0 and msg in r.stderr
 
 
-@pytest.mark.parametrize("family", ["krea2", "ideogram4", "z-image", "flux", "qwen-image"])
+@pytest.mark.parametrize("family", ["krea2", "ideogram4", "z-image", "flux"])  # qwen-image: D9, no cap
 def test_shipped_recipes_enable_d6_with_valid_settings(family, tmp_path):
     args = recipe_args(family)
-    assert args[args.index("--epoch-cap") + 1] == "5" and args[args.index("--extra-members") + 1] == "1"
+    last = lambda name: [args[i + 1] for i, a in enumerate(args) if a == name][-1]  # argparse: last wins
+    assert last("--epoch-cap") == "5" and last("--extra-members") == "1"
     r = run_train_validation(args, tmp_path)
     assert "No module named 'torch'" in r.stderr
