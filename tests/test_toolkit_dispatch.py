@@ -88,9 +88,17 @@ def test_every_toolkit_combo_has_a_template_or_musubi_path():
         assert os.path.isfile(os.path.join(ROOT, "templates", template)), template
 
 
+def valid_checkpoint(tag=b"\x00\x00\x80?"):
+    import json
+    import struct
+    header = json.dumps({"lora.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}).encode()
+    header += b" " * (-len(header) % 8)
+    return struct.pack("<Q", len(header)) + header + tag
+
+
 def touch(d, name):
     p = os.path.join(d, name)
-    open(p, "wb").write(name.encode())
+    open(p, "wb").write(valid_checkpoint(name.encode()[-4:]))
     return p
 
 
@@ -103,7 +111,8 @@ def test_finalize_prefers_the_final_save(tmp_path):
     chosen = it.finalize_toolkit_output(d, "repo1")
     assert os.path.basename(chosen) == "repo1.safetensors"
     assert sorted(os.listdir(d)) == ["last.safetensors", "optimizer.pt"]
-    assert open(os.path.join(d, "last.safetensors"), "rb").read() == b"repo1.safetensors"
+    assert open(os.path.join(d, "last.safetensors"), "rb").read() == valid_checkpoint(b"sors")
+    assert it.safetensors_complete(os.path.join(d, "last.safetensors"))
 
 
 def test_finalize_falls_back_to_highest_step_when_cut_short(tmp_path):
@@ -124,8 +133,50 @@ def test_finalize_with_nothing_saved_returns_none(tmp_path):
 def test_run_until_stops_a_trainer_at_the_deadline():
     it = load_trainer()
     t0 = time.time()
-    rc = it.run_until([sys.executable, "-c", "import time; time.sleep(60)"], time.time() + 1.5)
-    assert rc != 0 and time.time() - t0 < 30
+    rc, stopped = it.run_until([sys.executable, "-c", "import time; time.sleep(60)"], time.time() + 1.5)
+    assert rc != 0 and stopped and time.time() - t0 < 30
+
+
+def test_run_until_normal_exit_returns_rc():
+    it = load_trainer()
+    assert it.run_until([sys.executable, "-c", "raise SystemExit(3)"], time.time() + 60) == (3, True)
+
+
+@pytest.mark.parametrize("data,ok", [
+    (None, True), (b"", False), (b"\x00" * 7, False), ("trunc", False), ("extra", False), ("badjson", False),
+    ("empty", False), ("bad_offsets", False)])
+def test_safetensors_complete(tmp_path, data, ok):
+    it = load_trainer()
+    good = valid_checkpoint()
+    import struct
+    if data is None:
+        data = good
+    elif data == "trunc":
+        data = good[:-1]
+    elif data == "extra":
+        data = good + b"x"
+    elif data == "badjson":
+        data = struct.pack("<Q", 8) + b"{notjson"
+    elif data == "empty":
+        data = struct.pack("<Q", 8) + b"{}      "
+    elif data == "bad_offsets":
+        h = b'{"a":{"dtype":"F32","shape":[1],"data_offsets":[4,0]}}'
+        data = struct.pack("<Q", len(h)) + h + b"xxxx"
+    p = tmp_path / "x.safetensors"
+    p.write_bytes(data)
+    assert it.safetensors_complete(str(p)) is ok
+
+
+def test_not_stopped_group_is_not_finalized(monkeypatch, tmp_path):
+    it = load_trainer()
+    monkeypatch.setattr(it, "run_until", lambda cmd, deadline: (-9, False))
+    called = []
+    monkeypatch.setattr(it, "finalize_toolkit_output", lambda *a: called.append(a))
+    a = type("A", (), dict(task_id="t1", model="org/m", dataset_zip="/x.zip", model_type="moss-image-base",
+                           expected_repo_name="repo1", hours_to_complete=1.0, trigger_word=None))()
+    with pytest.raises(SystemExit) as e:
+        it.run_toolkit(a, "edit", time.time() + 100)
+    assert e.value.code != 0 and not called
 
 
 def test_run_toolkit_ships_last_and_exits_zero(monkeypatch, tmp_path):
@@ -136,7 +187,7 @@ def test_run_toolkit_ships_last_and_exits_zero(monkeypatch, tmp_path):
     def fake_run(cmd, deadline):
         assert cmd[1] == it.TOOLKIT_ENTRY and "--training-mode" in cmd
         touch(str(out), "repo1.safetensors")
-        return 0
+        return 0, True
 
     monkeypatch.setattr(it, "run_until", fake_run)
     real_join = os.path.join

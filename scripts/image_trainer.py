@@ -1,5 +1,6 @@
 import argparse
 import glob
+import json
 import os
 import re
 import shutil
@@ -59,45 +60,136 @@ def resolve_model_dir(model):
     raise FileNotFoundError(f"model dir for {model!r} not found under {CACHE}/models")
 
 
+def safetensors_complete(path):
+    """Structural check of a safetensors file without loading tensors: an 8-byte header length, a JSON header whose
+    tensors all lie inside the data section, at least one tensor, and a file length that ends exactly at the data
+    section's end. A save interrupted at the deadline fails this."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            raw = f.read(8)
+            if len(raw) != 8:
+                return False
+            n = int.from_bytes(raw, "little")
+            if n <= 0 or 8 + n > size or n > 100 * 1024 * 1024:
+                return False
+            header = json.loads(f.read(n))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(header, dict):
+        return False
+    end = 0
+    tensors = 0
+    for key, meta in header.items():
+        if key == "__metadata__":
+            continue
+        offs = meta.get("data_offsets") if isinstance(meta, dict) else None
+        if not (isinstance(offs, list) and len(offs) == 2 and all(isinstance(o, int) for o in offs) and 0 <= offs[0] <= offs[1]):
+            return False
+        end = max(end, offs[1])
+        tensors += 1
+    return tensors > 0 and size == 8 + n + end
+
+
 def finalize_toolkit_output(out_dir, name):
-    """Leave exactly one unambiguous LoRA for the evaluator: the final save (AI Toolkit `<name>.safetensors`,
-    Musubi `<name>.safetensors`), else the highest-step intermediate if training was cut short. It is copied to
-    last.safetensors, which select_lora() prefers; the other .safetensors files are removed from the upload."""
+    """Leave exactly one complete LoRA for the evaluator as last.safetensors, which select_lora() prefers.
+    Candidates in order: the trainer's final save (AI Toolkit and Musubi both write `<name>.safetensors`), then the
+    numbered intermediates from the highest step/epoch down, then a single unnamed file. The first candidate that
+    passes safetensors_complete() is published through a temporary file and an atomic rename; only then are the
+    original .safetensors files removed. Returns the chosen path, or None (nothing published, nothing removed).
+    Call only after the trainer's whole process group has stopped (run_until)."""
     files = [f for f in glob.glob(os.path.join(out_dir, "*.safetensors")) if os.path.basename(f) != "last.safetensors"]
     final = os.path.join(out_dir, f"{name}.safetensors")
-    chosen = final if final in files else None
-    if chosen is None:
-        numbered = [(int(m.group(1)), f) for f in files if (m := re.search(r"[-_](\d+)\.safetensors$", f))]
-        chosen = max(numbered)[1] if numbered else (files[0] if len(files) == 1 else None)
+    numbered = sorted(((int(m.group(1)), f) for f in files if f != final
+                       and (m := re.search(r"[-_](\d+)\.safetensors$", f))), reverse=True)
+    order = ([final] if final in files else []) + [f for _, f in numbered]
+    if not order and len(files) == 1:
+        order = files
+    chosen = next((f for f in order if safetensors_complete(f)), None)
     if chosen is None:
         return None
     dst = os.path.join(out_dir, "last.safetensors")
-    shutil.copy2(chosen, dst)
+    tmp = dst + ".tmp"
+    shutil.copyfile(chosen, tmp)
+    if not safetensors_complete(tmp):
+        os.remove(tmp)
+        return None
+    os.replace(tmp, dst)
     for f in files:
         os.remove(f)
     return chosen
 
 
-def run_until(cmd, deadline):
-    """Run cmd in its own process group; stop it at the deadline so the saves made so far can still be shipped."""
-    proc = subprocess.Popen(cmd, start_new_session=True)
+def _reap_children(leader=None):
+    # In the container this process is PID 1, so orphaned trainer processes are re-parented to it: reap them, or
+    # their zombies would keep the process group "alive" forever. The leader's own status is kept on its Popen.
     while True:
         try:
-            return proc.wait(timeout=max(1.0, min(30.0, deadline - time.time())))
+            pid, status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if pid == 0:
+            return
+        if leader is not None and pid == leader.pid and leader.returncode is None:
+            leader.returncode = os.waitstatus_to_exitcode(status)
+
+
+def _group_alive(pgid, leader=None):
+    _reap_children(leader)
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def stop_group(pgid, term_s=60, kill_s=30, leader=None):
+    """SIGTERM the whole process group, then SIGKILL whatever is left (including descendants whose parent already
+    exited). Every wait is bounded (term_s + kill_s, inside the 180 s kill margin). Returns True once no process of
+    the group remains."""
+    for sig, wait_s in ((signal.SIGTERM, term_s), (signal.SIGKILL, kill_s)):
+        if not _group_alive(pgid, leader):
+            return True
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            return True
+        t_end = time.time() + wait_s
+        while time.time() < t_end:
+            if not _group_alive(pgid, leader):
+                return True
+            time.sleep(0.2)
+    return not _group_alive(pgid, leader)
+
+
+def run_until(cmd, deadline, term_s=60, kill_s=30):
+    """Run cmd in its own process group (session). At the deadline, or as soon as the leader exits, make sure no
+    process of that group is still running before returning, so checkpoint finalization never races a writer.
+    Returns (rc, stopped): rc is the leader's exit code (or -9 if it had to be killed), stopped is False only if
+    the group could not be confirmed gone within the bounded waits."""
+    proc = subprocess.Popen(cmd, start_new_session=True)
+    rc = None
+    while rc is None:
+        try:
+            rc = proc.wait(timeout=max(0.2, min(30.0, deadline - time.time())))
         except subprocess.TimeoutExpired:
-            if time.time() < deadline:
-                continue
-            print("deadline reached: stopping trainer", flush=True)
-            for sig, wait_s in ((signal.SIGTERM, 60), (signal.SIGKILL, 30)):
+            if time.time() >= deadline:
+                print("deadline reached: stopping trainer", flush=True)
+                break
+    if rc is None or _group_alive(proc.pid, proc):
+        stopped = stop_group(proc.pid, term_s, kill_s, leader=proc)
+        if rc is None:
+            if proc.returncode is not None:
+                rc = proc.returncode
+            else:
                 try:
-                    os.killpg(proc.pid, sig)
-                except ProcessLookupError:
-                    pass
-                try:
-                    return proc.wait(timeout=wait_s)
+                    rc = proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    continue
-            return proc.wait()
+                    rc = -9
+        return rc, stopped
+    return rc, True
 
 
 def run_toolkit(a, mode, deadline):
@@ -108,8 +200,11 @@ def run_toolkit(a, mode, deadline):
         cmd += ["--trigger-word", a.trigger_word]
     if logs_enabled():
         print("running:", " ".join(cmd), flush=True)
-    rc = run_until(cmd, deadline)
+    rc, stopped = run_until(cmd, deadline)
     out_dir = os.path.join("/app/checkpoints", a.task_id, a.expected_repo_name)
+    if not stopped:
+        print("trainer processes could not be confirmed stopped; not finalizing", flush=True)
+        sys.exit(rc or 1)
     chosen = finalize_toolkit_output(out_dir, a.expected_repo_name) if os.path.isdir(out_dir) else None
     print(f"toolkit exit code {rc}; shipped {chosen or 'nothing'}", flush=True)
     sys.exit(0 if chosen else (rc or 1))
