@@ -1,6 +1,6 @@
-"""Run AI Toolkit's run.py with every RNG seeded from G56_SEED (D12), so seeded members differ in LoRA init, noise
-and timestep draws. A fresh torch process otherwise starts from the same default seed, which would make members
-identical. Usage (cwd = the AI Toolkit root): python3 seeded_run.py <config.yaml>"""
+"""Run AI Toolkit's run.py with every RNG seeded from G56_SEED (D12), so each member gets a controlled, reproducible
+seed for LoRA init, noise and timestep draws (members use 1000 + k). Usage (cwd = the AI Toolkit root):
+python3 seeded_run.py <config.yaml>"""
 import os
 import random
 import runpy

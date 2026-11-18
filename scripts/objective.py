@@ -116,6 +116,8 @@ def average_loras(state_dicts):
         ref = state_dicts[0][key]
         if not ref.is_floating_point():
             raise ValueError(f"cannot average non-float tensor {key}")
+        if any(sd[key].shape != ref.shape for sd in state_dicts):
+            raise ValueError(f"tensor shapes differ between members: {key}")
         out[key] = (sum(sd[key].float() for sd in state_dicts) / k).to(ref.dtype)
     return out
 
@@ -127,7 +129,8 @@ def write_average(paths, dst):
 
     sds = [load_file(str(p)) for p in paths]
     with safe_open(str(paths[0]), framework="pt") as f:
-        meta = dict(f.metadata() or {})
+        # member 0's descriptive metadata; content hashes no longer describe the aggregate, so they are dropped
+        meta = {k: v for k, v in (f.metadata() or {}).items() if "hash" not in k.lower()}
     meta["g56_members"] = str(len(sds))
     avg = average_loras(sds)
     tmp = str(dst) + ".tmp"

@@ -113,16 +113,24 @@ def test_non_lora_tensors_are_averaged_and_dtype_kept():
     assert avg["a.b.lora_B.weight"].dtype == torch.bfloat16
 
 
+def test_non_paired_shape_mismatch_raises():
+    a, b = _lora(1), _lora(2)
+    a["x.diff"], b["x.diff"] = torch.ones(1, 3), torch.ones(2, 3)
+    with pytest.raises(ValueError):
+        objective.average_loras([a, b])
+
+
 def test_write_average_is_atomic_and_keeps_metadata(tmp_path):
     paths = []
     for s in (1, 2):
         p = tmp_path / f"m{s}.safetensors"
-        save_file(_lora(s), str(p), metadata={"format": "pt", "software": "ai-toolkit"})
+        save_file(_lora(s), str(p), metadata={"format": "pt", "software": "ai-toolkit", "sshs_model_hash": f"h{s}"})
         paths.append(p)
     dst = tmp_path / "final.safetensors"
     assert objective.write_average(paths, dst) == 2
     with safe_open(str(dst), framework="pt") as f:
         assert f.metadata()["software"] == "ai-toolkit" and f.metadata()["g56_members"] == "2"
+        assert "sshs_model_hash" not in f.metadata()
     assert not (tmp_path / "final.safetensors.tmp").exists()
 
 

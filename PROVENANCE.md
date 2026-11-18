@@ -11,7 +11,8 @@ New image families (image-v2, after G.O.D #1420): `scripts/toolkit_entry.py` and
 Gradients-on-Demand repository (Apache-2.0, same LICENSE.md and NOTICE as above):
 
 - Source: https://github.com/gradients-ai/G.O.D (`ops/docker/scripts/image_toolkit_entrypoint.py`, `core/training_templates/`)
-- Commit: 14c3208 (#1420, "Add next image families and native-loss evaluation"); the only change is the template directory.
+- Commit: 14c3208 (#1420, "Add next image families and native-loss evaluation"); when imported (D10) the only change was
+  the template directory. D11/D12 later added the objective alignment and the member loop (see CHANGES-vs-champion.md).
 - The base image and the AI Toolkit / Musubi pins in `ops/docker/standalone-image-toolkit-trainer.dockerfile` are the
   same as in that commit's reference toolkit trainer, with the base pinned by digest.
 
