@@ -14,3 +14,9 @@ Gradients-on-Demand repository (Apache-2.0, same LICENSE.md and NOTICE as above)
 - Commit: 14c3208 (#1420, "Add next image families and native-loss evaluation"); the only change is the template directory.
 - The base image and the AI Toolkit / Musubi pins in `ops/docker/standalone-image-toolkit-trainer.dockerfile` are the
   same as in that commit's reference toolkit trainer, with the base pinned by digest.
+
+D11/D12 (image-v3) are our own code. The ideas of training only in the evaluator's scored timestep band at 1024 with
+0.5 caption dropout, sizing steps to the image count, and averaging independently seeded runs follow the published
+11-16 image tournament winner (https://github.com/gradients-opensource/god-image-tourn-0f1ae73803ee5e95-20261116-position-1,
+commit 9305ac527f798a0b984fbbebb54b051c605ee2a5); no code was copied from it. The objective constants mirror the public
+G.O.D evaluator (`validator/evaluation/evaluators/diffusion_objective.py`).

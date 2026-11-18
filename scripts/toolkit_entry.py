@@ -7,10 +7,15 @@ import json
 import os
 import shutil
 import subprocess
+import sys
+import time
 import zipfile
 from pathlib import Path
 
 import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import objective  # noqa: E402  (D11/D12, our code)
 
 
 CACHE_ROOT = Path("/cache")
@@ -66,6 +71,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expected-repo-name", required=True)
     parser.add_argument("--hours-to-complete", required=True)
     parser.add_argument("--trigger-word")
+    parser.add_argument("--deadline-epoch", type=float, default=None,
+                        help="wall-clock time at which image_trainer.py stops the trainer (enables D12 members)")
     return parser.parse_args()
 
 
@@ -377,6 +384,79 @@ def run_hidream_edit(args: argparse.Namespace, dataset_path: Path, control_paths
     )
 
 
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
+SEEDED_RUN = Path(__file__).resolve().parent / "seeded_run.py"
+
+
+def count_images(dataset_path: Path) -> int:
+    return sum(1 for p in Path(dataset_path).iterdir() if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES)
+
+
+def align_config(config_path: Path, model_type: str, n_images: int) -> None:
+    """D11: train the declared objective (see objective.py). Only the declared model type and image count are used."""
+    with config_path.open() as file:
+        config = yaml.safe_load(file)
+    steps = objective.align_process(config["config"]["process"][0], model_type, n_images)
+    with config_path.open("w") as file:
+        yaml.safe_dump(config, file, sort_keys=False)
+    print(f"objective: {n_images} images -> {steps} steps per member", flush=True)
+
+
+def _lora_complete(path: Path) -> bool:
+    try:
+        from safetensors import safe_open
+        with safe_open(str(path), framework="pt") as f:
+            return len(list(f.keys())) > 0
+    except Exception:
+        return False
+
+
+def run_members(args: argparse.Namespace, config_path: Path, deadline: float) -> None:
+    """D12: train independently seeded members until the next one no longer fits, and publish the exact average of
+    all finished members at the trainer's final path after each one. Member 0 uses the unchanged layout, so with one
+    member the output is exactly a single run; later members only replace it through an atomic rename."""
+    with config_path.open() as file:
+        base = yaml.safe_load(file)
+    name = base["config"]["name"]
+    task_root = CHECKPOINTS_ROOT / args.task_id
+    final = task_root / name / f"{name}.safetensors"
+    members_root = task_root / "members"
+    members_root.mkdir(parents=True, exist_ok=True)
+    finished, walls = [], []
+    k = 0
+    while True:
+        config = yaml.safe_load(yaml.safe_dump(base))
+        process = config["config"]["process"][0]
+        out = final
+        if k > 0:
+            process["training_folder"] = str(members_root / f"m{k}")
+            process.setdefault("save", {})["save_every"] = int(process.get("train", {}).get("steps", 1000)) + 1
+            out = members_root / f"m{k}" / name / f"{name}.safetensors"
+        member_config = CONFIG_OUTPUT_ROOT / f"{args.task_id}_m{k}.yaml"
+        with member_config.open("w") as file:
+            yaml.safe_dump(config, file, sort_keys=False)
+        env = dict(OFFLINE_HUB_ENV, G56_SEED=str(1000 + k))
+        t0 = time.time()
+        rc = subprocess.run(["python3", str(SEEDED_RUN), str(member_config)], cwd=AI_TOOLKIT_ROOT, env=env).returncode
+        walls.append(time.time() - t0)
+        if rc != 0 or not _lora_complete(out):
+            if k == 0:
+                raise RuntimeError(f"member 0 failed (exit {rc})")
+            print(f"member {k} failed (exit {rc}); keeping the average of {len(finished)}", flush=True)
+            break
+        if k == 0:
+            keep = members_root / "m0.safetensors"
+            shutil.copyfile(out, keep)
+            finished.append(keep)
+        else:
+            finished.append(out)
+            objective.write_average(finished, final)
+        print(f"member {k} done in {walls[-1]:.0f} s; shipped average of {len(finished)}", flush=True)
+        k += 1
+        if not objective.next_member_fits(walls, time.time(), deadline):
+            break
+
+
 def main() -> None:
     args = parse_args()
     dataset_path, control_paths = prepare_dataset(args.task_id, args.training_mode)
@@ -384,6 +464,11 @@ def main() -> None:
         run_hidream_edit(args, dataset_path, control_paths)
         return
     config_path = prepare_config(args, dataset_path, control_paths)
+    if objective.enabled("G56_OBJECTIVE"):
+        align_config(config_path, args.model_type, count_images(dataset_path))
+    if args.deadline_epoch is not None and objective.enabled("G56_MEMBERS"):
+        run_members(args, config_path, args.deadline_epoch)
+        return
     subprocess.run(["python3", "run.py", str(config_path)], cwd=AI_TOOLKIT_ROOT, env=OFFLINE_HUB_ENV, check=True)
 
 

@@ -39,7 +39,11 @@ RUN python3 -m venv /opt/venv-ours && \
         diffusers==0.39.0 transformers==5.10.2 huggingface-hub==1.18.0 safetensors==0.8.0 pydantic==2.13.4 pillow numpy
 RUN mkdir -p /opt/godtrainer/assets && \
     curl -fL -o /opt/godtrainer/assets/qwen_image_vae.safetensors https://huggingface.co/Comfy-Org/Krea-2/resolve/main/vae/qwen_image_vae.safetensors && \
-    curl -fL -o /opt/godtrainer/assets/flux2-vae.safetensors https://huggingface.co/Comfy-Org/Ideogram-4/resolve/main/vae/flux2-vae.safetensors
+    curl -fL -o /opt/godtrainer/assets/flux2-vae.safetensors https://huggingface.co/Comfy-Org/Ideogram-4/resolve/main/vae/flux2-vae.safetensors && \
+    printf '%s  %s\n' \
+        a70580f0213e67967ee9c95f05bb400e8fb08307e017a924bf3441223e023d1f /opt/godtrainer/assets/qwen_image_vae.safetensors \
+        868fe7b343cc8f3a19dbcfcafbc3d5f888802be3f89bd81b65b3621a066ce8f3 /opt/godtrainer/assets/flux2-vae.safetensors \
+        | sha256sum -c -
 
 COPY trainer /app/trainer
 COPY scripts /app/scripts

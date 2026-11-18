@@ -195,7 +195,7 @@ def run_until(cmd, deadline, term_s=60, kill_s=30):
 def run_toolkit(a, mode, deadline):
     cmd = [sys.executable, TOOLKIT_ENTRY, "--task-id", a.task_id, "--model", a.model, "--dataset-zip", a.dataset_zip,
            "--model-type", a.model_type, "--training-mode", mode, "--expected-repo-name", a.expected_repo_name,
-           "--hours-to-complete", str(a.hours_to_complete)]
+           "--hours-to-complete", str(a.hours_to_complete), "--deadline-epoch", f"{deadline:.3f}"]
     if a.trigger_word:
         cmd += ["--trigger-word", a.trigger_word]
     if logs_enabled():
